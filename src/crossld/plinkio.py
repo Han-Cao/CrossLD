@@ -524,8 +524,10 @@ def resolve_targets(
 
     n_miss = 0
     for vid in ids:
-        if vid not in seen:
-            seen.add(vid)
+        if vid in seen:
+            continue
+
+        seen.add(vid)
         index = ds.index_of(vid)
         if index is None:
             n_miss += 1
@@ -570,7 +572,10 @@ def candidate_indices(
         idx_k = idx_k[lo:hi]
 
     if window_count > 0 and idx_k.size > window_count:
-        distance = np.abs(pos_k - pos_a)
+        # Cast to int64 before subtracting: pos arrays are uint32, and an
+        # unsigned underflow would report variants left of the target as
+        # ~2**32 bp away instead of their true distance.
+        distance = np.abs(pos_k.astype(np.int64) - pos_a)
         order = np.argsort(distance, kind="stable")[:window_count]
         idx_k = idx_k[order]
 
