@@ -12,25 +12,14 @@ are valid observations.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
-
 import numpy as np
 import numpy.typing as npt
+
+from crossld.blocks import BlockMatrix
 
 # Pair-level skip reasons, reported through logging.
 SKIP_MISSING = "n<3"
 SKIP_ZERO_VARIANCE = "zero_variance"
-SKIP_SAME_ID = "same_id"
-
-
-@dataclass(frozen=True)
-class PairResult:
-    """One LD result for ``target`` × ``other``."""
-
-    index_a: int
-    index_b: int
-    r: float
-    r2: float
 
 
 def alt_freq(values: npt.NDArray) -> float:
@@ -58,14 +47,13 @@ def alt_freq_sparse(values: npt.NDArray, sample_ct: int) -> float:
 def major_allele_flipped(values: npt.NDArray) -> bool:
     """True when the ALT-coded vector must be mirrored to represent the major allele.
 
-    Returns ``True`` when the ALT allele frequency is **at most** 0.5 (missing
-    samples ignored), matching PLINK 2's convention; ties resolve to REF.
+    Returns ``True`` when the ALT allele frequency > 0.5.
     """
 
     af = alt_freq(values)
     if not np.isfinite(af):
         return False
-    return af <= 0.5
+    return af > 0.5
 
 
 def major_allele_flipped_sparse(values: npt.NDArray, sample_ct: int) -> bool:
@@ -74,19 +62,10 @@ def major_allele_flipped_sparse(values: npt.NDArray, sample_ct: int) -> bool:
     af = alt_freq_sparse(values, sample_ct)
     if not np.isfinite(af):
         return False
-    return af <= 0.5
+    return af > 0.5
 
 
-def orient(values: np.ndarray, flipped: bool) -> np.ndarray:
-    """Recode an ALT-count vector to the REF allele when ``flipped`` is true."""
-
-    if not flipped:
-        return values
-    out = np.where(values < 0, values, 2.0 - values)
-    return out
-
-
-def pearson_pairwise(target: np.ndarray, block: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+def pearson_pairwise(target: npt.NDArray, block: npt.NDArray) -> tuple[npt.NDArray, npt.NDArray]:
     """Pearson r between ``target`` and every row of ``block``.
 
     Returns ``(r, n)`` where ``n`` is the per-pair non-missing sample count.
@@ -126,8 +105,8 @@ def pearson_pairwise(target: np.ndarray, block: np.ndarray) -> tuple[np.ndarray,
 
 def pearson_pairwise_sparse(
     target: np.ndarray,
-    sample_idxs: list[npt.NDArray[np.uint32]] | npt.NDArray[np.uint32],
-    values: list[npt.NDArray] | npt.NDArray,
+    sample_idxs: list[npt.NDArray[np.uint32]],
+    values: list[npt.NDArray],
 ) -> tuple[np.ndarray, np.ndarray]:
     """Pearson r between ``target`` and one or more sparse block rows.
 
@@ -137,14 +116,8 @@ def pearson_pairwise_sparse(
     densifying.
     """
 
-    single = isinstance(sample_idxs, np.ndarray)
-    if single:
-        sample_idxs = [sample_idxs]
-        values = [values]
-
-    target = np.asarray(target)
     t_valid = target >= 0
-    t0 = float(t_valid.sum())
+    t0 = int(t_valid.sum())
     t_valid_values = target[t_valid]
     t1 = float(t_valid_values.sum())
     t2 = float((t_valid_values * t_valid_values).sum())
@@ -154,11 +127,11 @@ def pearson_pairwise_sparse(
     n_out = np.zeros(n_rows, dtype=np.int64)
 
     for k in range(n_rows):
-        idx = np.asarray(sample_idxs[k], dtype=np.int64)
-        v = np.asarray(values[k], dtype=np.float64)
+        idx = sample_idxs[k]
+        v = values[k]
 
         if idx.size == 0:
-            n = int(t0)
+            n = t0
             sum_x = 0.0
             sum_x2 = 0.0
             sum_xt = 0.0
@@ -166,27 +139,29 @@ def pearson_pairwise_sparse(
             sum_t2 = t2
         else:
             t_listed = target[idx]
-            t_ok = t_listed >= 0
-            good = (v >= 0) & t_ok
+            t_listed_valid = t_listed >= 0
+            vt_valid = (v >= 0) & t_listed_valid
 
-            # Unlisted samples are valid, so start from every valid target
-            # sample and drop only listed samples with a missing value.
-            v_missing = int(((v < 0) & t_ok).sum())
-            n = int(t0) - v_missing
+            # t0 already handles invalid target
+            # so check missing in v & t_listed_valid v missing only
+            v_missing = int(((v < 0) & t_listed_valid).sum())
+            n = t0 - v_missing
 
-            drop = (~good) & t_ok
-            sum_t = t1 - float(t_listed[drop].sum())
-            sum_t2 = t2 - float((t_listed[drop] ** 2).sum())
+            if n < 3:
+                n_out[k] = n
+                continue
 
-            good_v = v[good]
-            good_t = t_listed[good]
+            t_drop_by_v = (~vt_valid) & t_listed_valid
+            sum_t = t1 - float(t_listed[t_drop_by_v].sum())
+            sum_t2 = t2 - float((t_listed[t_drop_by_v] ** 2).sum())
+
+            good_v = v[vt_valid]
+            good_t = t_listed[vt_valid]
             sum_x = float(good_v.sum())
             sum_x2 = float((good_v * good_v).sum())
             sum_xt = float((good_v * good_t).sum())
 
         n_out[k] = n
-        if n < 3:
-            continue
 
         numerator = n * sum_xt - sum_x * sum_t
         var_x = n * sum_x2 - sum_x * sum_x
@@ -203,7 +178,7 @@ def pearson_pairwise_sparse(
     return r_out, n_out
 
 
-def pearson_pairwise_block(target: np.ndarray, block) -> tuple[np.ndarray, np.ndarray]:
+def pearson_pairwise_block(target: npt.NDArray, block: BlockMatrix) -> tuple[npt.NDArray, npt.NDArray]:
     """Pearson r between ``target`` and a :class:`crossld.blocks.BlockMatrix`.
 
     Returns ``(r, n)`` aligned with the block's requested row order (dense and
@@ -214,8 +189,10 @@ def pearson_pairwise_block(target: np.ndarray, block) -> tuple[np.ndarray, np.nd
 
     n_rows = int(block.stats.variants)
     r = np.full(n_rows, np.nan, dtype=np.float64)
-    n = np.zeros(n_rows, dtype=np.int64)
+    n = np.zeros(n_rows, dtype=np.uint32)
 
+    # TODO:
+    # faster path for data without NAs, this is more common case for LD analysis
     if block.dense_rows.size:
         r_dense, n_dense = pearson_pairwise(target, block.dense)
         r[block.dense_rows] = r_dense
@@ -231,28 +208,13 @@ def pearson_pairwise_block(target: np.ndarray, block) -> tuple[np.ndarray, np.nd
     return r, n
 
 
-def compute_pair(target: np.ndarray, other: np.ndarray) -> tuple[float, float]:
-    """Scalar helper returning ``(r, r2)`` for a single pair (``NaN`` when invalid)."""
-
-    r, _ = pearson_pairwise(target, other.reshape(1, -1))
-    value = float(r[0])
-    if np.isnan(value):
-        return float("nan"), float("nan")
-    clipped = max(-1.0, min(1.0, value))
-    return clipped, clipped * clipped
-
-
 __all__ = [
     "SKIP_MISSING",
-    "SKIP_SAME_ID",
     "SKIP_ZERO_VARIANCE",
-    "PairResult",
     "alt_freq",
     "alt_freq_sparse",
-    "compute_pair",
     "major_allele_flipped",
     "major_allele_flipped_sparse",
-    "orient",
     "pearson_pairwise",
     "pearson_pairwise_block",
     "pearson_pairwise_sparse",
