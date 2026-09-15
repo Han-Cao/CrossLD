@@ -1,14 +1,9 @@
-"""Result formatting: the tabular ``.vcor``-style output writer.
+"""Result formatting: the PLINK2 tabular ``.vcor``-style output writer.
 
-Two output shapes are supported:
 
 * ``r^2`` only -- ``#CHROM_A POS_A ID_A CHROM_B POS_B ID_B UNPHASED_R2``
 * signed ``r`` -- the coding allele is reported for each side, so the sign is
   interpretable: ``... ID_A <MAJ|REF>_A ... ID_B <MAJ|REF>_B UNPHASED_R``
-
-The allele column names mirror the curated reference files
-(``ld_results_r_major.vcor`` uses ``MAJ_A``/``MAJ_B``, ``ld_results_r_ref.vcor``
-uses ``REF_A``/``REF_B``).
 """
 
 from __future__ import annotations
@@ -23,7 +18,7 @@ HEADER_R_REF = (
     "#CHROM_A\tPOS_A\tID_A\tREF_A\tCHROM_B\tPOS_B\tID_B\tREF_B\tUNPHASED_R"
 )
 
-# The reference output prints six significant digits ("1.0" -> "1", "0.35567").
+# PLINK2 output prints six significant digits ("1.0" -> "1", "0.35567").
 VALUE_FORMAT = "%.6g"
 
 
@@ -58,21 +53,19 @@ def format_row(
     r: float,
     r2: float,
     with_r: bool,
-    allele_label: str = "MAJ",
     allele_a: str = "",
     allele_b: str = "",
 ) -> str:
     """Render one result row without the trailing newline."""
 
-    fields = [str(chrom_a), str(pos_a), str(id_a)]
+    fields_a = [str(chrom_a), str(pos_a), str(id_a)]
+    fields_b = [str(chrom_b), str(pos_b), str(id_b)]
     if with_r:
-        fields.append(str(allele_a))
-    fields += [str(chrom_b), str(pos_b), str(id_b)]
-    if with_r:
-        fields.append(str(allele_b))
-        fields.append(format_value(r))
+        fields_a.append(str(allele_a))
+        fields_b.append(str(allele_b))
+        fields = fields_a + fields_b + [format_value(r)]
     else:
-        fields.append(format_value(r2))
+        fields = fields_a + fields_b + [format_value(r2)]
     return "\t".join(fields)
 
 
@@ -92,7 +85,6 @@ def write_row(
     id_b: str,
     r: float,
     r2: float,
-    allele_label: str = "MAJ",
     allele_a: str = "",
     allele_b: str = "",
 ) -> None:
@@ -107,7 +99,6 @@ def write_row(
             r=r,
             r2=r2,
             with_r=with_r,
-            allele_label=allele_label,
             allele_a=allele_a,
             allele_b=allele_b,
         )
