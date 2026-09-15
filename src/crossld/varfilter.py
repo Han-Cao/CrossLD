@@ -14,7 +14,7 @@ import numpy as np
 import numpy.typing as npt
 
 from crossld.logging_setup import LOGGER_NAME
-from crossld.plinkio import PlinkDataset
+from crossld.plinkio import PlinkDataset, PlinkIOError
 
 logger = logging.getLogger(f"{LOGGER_NAME}.varfilter")
 
@@ -22,7 +22,7 @@ ID_OPTIONS = ("extract", "exclude")
 BED_OPTIONS = ("extract_bed", "exclude_bed")
 
 
-class VarFilterError(Exception):
+class VarFilterError(PlinkIOError):
     """Fatal, user-facing error (reported as ``error: ...`` and exit code 2)."""
 
 
@@ -70,35 +70,21 @@ class VariantFilter:
         else:
             return np.ones(ds.variant_ct, dtype=bool)
 
-        # build vid index of ds if missing
-        if self.extract or self.exclude:
-            ds.build_vid_index()
-
-        # TODO:
-        # for large ids, consider using np.isin()
         if self.extract:
             ids = read_vid_file(self.extract)
-            exist_ids = set(ids).intersection(ds.unique_ids)
-            idx_extract: list[int] = []
-            for vid in exist_ids:
-                idx_extract.append(ds.index_of(vid))
+            self._warn_unmatched("--extract", self.extract, ids, ds)
+            idx_extract = _matching_indices(ds, ids)
             mask[idx_extract] = True
         if self.extract_bed:
-            extract_bed = read_bed_file(self.extract_bed)
-            in_extract_bed = _in_intervals(ds, extract_bed)
-            mask |= in_extract_bed
+            mask |= _in_intervals(ds, read_bed_file(self.extract_bed))
 
         if self.exclude:
             ids = read_vid_file(self.exclude)
-            exclude_ids = set(ids).intersection(ds.unique_ids)
-            idx_exclude: list[int] = []
-            for vid in exclude_ids:
-                idx_exclude.append(ds.index_of(vid))
+            self._warn_unmatched("--exclude", self.exclude, ids, ds)
+            idx_exclude = _matching_indices(ds, ids)
             mask[idx_exclude] = False
-        elif self.exclude_bed:
-            exclude_bed = read_bed_file(self.exclude_bed)
-            in_exclude_bed = _in_intervals(ds, exclude_bed)
-            mask &= ~in_exclude_bed
+        if self.exclude_bed:
+            mask &= ~_in_intervals(ds, read_bed_file(self.exclude_bed))
 
         kept = int(mask.sum())
         if kept == 0:
@@ -124,6 +110,34 @@ class VariantFilter:
             if path:
                 parts.append(f"--{name.replace('_', '-')}")
         return " and ".join(parts)
+
+    @staticmethod
+    def _warn_unmatched(
+        option: str, path: str, ids: list[str], ds: PlinkDataset
+    ) -> None:
+        known = set(ids)
+        matched = sum(1 for vid in known if ds.index_of(vid) is not None)
+        unmatched = len(known) - matched
+        if unmatched:
+            logger.warning(
+                "%s %s: %d of %d variant ID(s) matched no dataset-2 variant",
+                option,
+                path,
+                unmatched,
+                len(known),
+            )
+
+
+def _matching_indices(ds: PlinkDataset, ids: list[str]) -> npt.NDArray[np.int64]:
+    """Dataset-2 indexes for the listed IDs that exist (deduplicated)."""
+
+    ds.build_vid_index()
+    found: set[int] = set()
+    for vid in set(ids):
+        index = ds.index_of(vid)
+        if index is not None:
+            found.add(index)
+    return np.asarray(sorted(found), dtype=np.int64)
 
 
 def read_vid_file(path: str) -> list[str]:
@@ -175,23 +189,30 @@ def read_bed_file(path: str) -> list[tuple[str, int, int]]:
 
 
 def _normalize_chrom(chrom: str) -> str:
-    """Remove chr prefix"""
-    chrom = chrom.lower()
-    return chrom.removeprefix("chr")
+    """Strip a leading ``chr`` (case-insensitive) from a BED chromosome name.
+
+    PLINK chromosomes are stored as plain numbers (e.g. ``20``), so only BED
+    input needs this adjustment.
+    """
+
+    if chrom[:3].lower() == "chr":
+        return chrom[3:]
+    return chrom
 
 
-def _in_intervals(ds: PlinkDataset, intervals: list[tuple[str, int, int]]) -> npt.NDArray[np.bool_]:
+def _in_intervals(
+    ds: PlinkDataset, intervals: list[tuple[str, int, int]]
+) -> npt.NDArray[np.bool_]:
     mask = np.zeros(ds.variant_ct, dtype=bool)
     for chrom, start, end in intervals:
         entry = ds.get_sorted_index(chrom)
         if entry is None:
             continue
 
-        # pos is 1-based postion
-        # start, end is 0-based half-open interval
+        # pos is 1-based position; start, end is a 0-based half-open interval
         pos, idx = entry
-        lo = np.searchsorted(pos, start + 1, side="left")
-        hi = np.searchsorted(pos, end, side="right")
+        lo = int(np.searchsorted(pos, start + 1, side="left"))
+        hi = int(np.searchsorted(pos, end, side="right"))
         if lo < hi:
             mask[idx[lo:hi]] = True
 

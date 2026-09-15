@@ -9,6 +9,7 @@ from __future__ import annotations
 import logging
 import os
 from collections import defaultdict
+from collections.abc import KeysView
 from dataclasses import dataclass, field
 
 import numpy as np
@@ -26,52 +27,83 @@ class PlinkIOError(Exception):
 
 @dataclass
 class PlinkDataset:
-    """A resolved PLINK 1 or PLINK 2 dataset."""
+    """A resolved PLINK 1 or PLINK 2 dataset.
 
+    ``sample_ids`` holds every sample in file order; ``sample_subset`` holds the
+    increasing indexes of the samples used for analysis (``None`` = all
+    samples). Genotype reads therefore always come back in file order over
+    ``sample_subset``.
+
+    ``idx_bridge`` (dataset 1 only) converts a dataset-1 active-subset vector into
+    dataset-2 active-subset order::
+
+        samples1[sample_subset1][idx_bridge] == samples2[sample_subset2]
+    """
+
+    # required
     prefix: str
     fmt: str  # "bfile" or "pfile"
     genotype_path: str
     variant_path: str
     sample_path: str
     sample_ids: npt.NDArray[np.str_]
-    sample_subset: npt.NDArray[np.uint32] = None
-    dosage: bool = False
-    chrom: list[str] = field(default_factory=list)
+    chrom: list[str]
     pos: npt.NDArray[np.uint32]
     ids: list[str]
-    ref: list[str] = field(default_factory=list)
-    alt: list[str] = field(default_factory=list)
-    idx_bridge: npt.NDArray[np.uint32] = None
     _reader: pgenlib.PgenReader
     _pvar: pgenlib.PvarReader
+    # optional
+    ref: list[str] = field(default_factory=list)
+    alt: list[str] = field(default_factory=list)
+    sample_subset: npt.NDArray[np.uint32] | None = None
+    idx_bridge: npt.NDArray[np.uint32] | None = None
+    dosage: bool = False
     _vid_index: dict[str, int] | None = None
     _group_sort: dict[str, tuple[npt.NDArray[np.uint32], npt.NDArray[np.uint32]]] | None = None
 
-    def __post_init__(self) -> None:
+    @property
+    def variant_ct(self) -> int:
+        return len(self.ids)
+
+    @property
+    def sample_ct(self) -> int:
+        return len(self.sample_ids)
+
+    @property
+    def active_sample_ct(self) -> int:
+        """Samples the reader returns per variant (the active subset size)."""
+
         if self.sample_subset is None:
-            self.active_sample_ct = self.sample_ct
-        else:
-            self.active_sample_ct = len(self.sample_subset)
+            return self.sample_ct
+        return len(self.sample_subset)
+
+    @property
+    def reader(self) -> pgenlib.PgenReader:
+        """The active :class:`pgenlib.PgenReader`."""
+
+        return self._reader
 
     def build_vid_index(self) -> None:
-        if self.ids and not self._vid_index:
+        """Build the variant-ID lookup, idempotently."""
+
+        if self._vid_index is None:
             self._vid_index = {vid: i for i, vid in enumerate(self.ids)}
 
     def index_of(self, variant_id: str) -> int | None:
         if self._vid_index is None:
-            return None
+            self.build_vid_index()
         return self._vid_index.get(variant_id)
 
     @property
-    def unique_ids(self) -> set[str]:
+    def unique_ids(self) -> KeysView[str]:
         if self._vid_index is None:
             logger.debug("Unexpected behavior: query unique variant ID before building _vid_index")
-            return set(self.ids)
-        else:
-            return self._vid_index.keys()
+            self.build_vid_index()
+        return self._vid_index.keys()
 
     def sort_pos_by_chrom(self) -> None:
-        """Build a mapping: chrom -> (sorted positions, variant indices for sorted positions)."""
+        """Build a mapping: chrom -> (positions sorted, variant indices for those positions)."""
+
         if self._group_sort is not None:
             return
 
@@ -87,9 +119,14 @@ class PlinkDataset:
 
         self._group_sort = group_sort
 
-    def get_sorted_index(self, chrom: str) -> tuple[npt.NDArray[np.uint32], npt.NDArray[np.uint32]]:
+    def get_sorted_index(
+        self, chrom: str
+    ) -> tuple[npt.NDArray[np.uint32], npt.NDArray[np.uint32]] | None:
+        """Position-sorted ``(pos, variant_idx)`` for ``chrom``. Apply variant filter if exists."""
+
         if self._group_sort is None:
-            return None
+            logger.debug("Unexpected behavior: query sorted index before building _group_sort")
+            self.sort_pos_by_chrom()
         return self._group_sort.get(chrom)
 
     def close(self) -> None:
@@ -122,45 +159,48 @@ def _parse_fam(path: str) -> npt.NDArray[np.str_]:
 
 
 def _parse_psam(path: str) -> npt.NDArray[np.str_]:
-    """Read IIDs from a ``.psam`` file."""
+    """Read IIDs from a ``.psam`` file.
+
+    A ``#FID``/``#IID`` header is honoured (the IID column is located by name);
+    a file without a header is parsed as a ``.fam`` file.
+    """
 
     ids: list[str] = []
-    # check header for the first line
-    # if starts with #FID, find idx of IID
-    # if starts with #IID, set iid_idx to 0
-    # if starts with #other, raise error
-    # if no header, do _parse_fam
     with open(path, "r", encoding="utf-8") as handle:
         header = handle.readline().strip()
-        if header.startswith("#FID"):
-            fields = header.split()
-            iid_idx = fields.index("IID")
-        elif header.startswith("#IID"):
-            iid_idx = 0
+        if header.startswith(("#FID", "#IID")):
+            fields = header.lstrip("#").split()
+            try:
+                iid_idx = fields.index("IID")
+            except ValueError as exc:
+                raise PlinkIOError(
+                    f"{path}: .psam header has no IID column: {header!r}"
+                ) from exc
         elif header.startswith("#"):
             raise PlinkIOError(f"{path}: malformed .psam header: {header!r}")
         else:
             return _parse_fam(path)
 
-    with open(path, "r", encoding="utf-8") as handle:
-        for n_line, line in enumerate(handle, start=1):
+        for n_line, line in enumerate(handle, start=2):
             stripped = line.strip()
             if not stripped:
                 raise PlinkIOError(f"{path}: empty sample line in line {n_line}")
             fields = stripped.split()
+            if iid_idx >= len(fields):
+                raise PlinkIOError(f"{path}: malformed sample line: {stripped!r}")
             ids.append(fields[iid_idx])
     return np.array(ids)
 
 
-def parse_sample(path: str, type: str) -> npt.NDArray[np.str_]:
+def parse_sample(path: str, fmt: str) -> npt.NDArray[np.str_]:
     """Read sample IDs from a ``.fam`` or ``.psam`` file."""
 
-    if type == "bfile":
+    if fmt == "bfile":
         samples = _parse_fam(path)
-    elif type == "pfile":
+    elif fmt == "pfile":
         samples = _parse_psam(path)
     else:
-        raise PlinkIOError(f"unknown dataset type {type!r}")
+        raise PlinkIOError(f"unknown dataset type {fmt!r}")
 
     # check empty file
     if len(samples) == 0:
@@ -201,13 +241,13 @@ def select_samples(
 
     # check uniqueness of samples1 and samples2
     dataset_overlap = np.intersect1d(samples1, samples2, assume_unique=True)
-    
+
+    missing = None
     if keep_samples is not None:
         samples_ld = np.intersect1d(dataset_overlap, keep_samples, assume_unique=True)
         missing = np.setdiff1d(keep_samples, dataset_overlap, assume_unique=True)
     else:
         samples_ld = dataset_overlap
-        missing = None
 
     logger.info(
         "samples: dataset1=%d dataset2=%d shared=%d%s",
@@ -218,9 +258,7 @@ def select_samples(
     )
 
     if len(samples_ld) < 3:
-        raise PlinkIOError(
-            "At least 3 samples are required for LD analysis!"
-        )
+        raise PlinkIOError("At least 3 samples are required for LD analysis!")
 
     return samples_ld
 
@@ -250,7 +288,7 @@ def _resolve_files(prefix: str, fmt: str) -> tuple[str, str, str]:
                 f"--bfile {prefix}: missing file(s) {', '.join(prefix + m for m in missing)}"
             )
         return bed, bim, fam
-    
+
     elif fmt == "pfile":
         pgen = _get_file(f"{prefix}.pgen")
         pvar = _get_file(f"{prefix}.pvar")
@@ -275,28 +313,32 @@ def load_two_datasets(
     prefix2: str, fmt2: str, dosage2: bool,
     keep: str | None = None
 ) -> tuple[PlinkDataset, PlinkDataset]:
-    """Load dataset 1 and dataset 2, map analysis samples in dataset 2 to dataset 1."""
+    """Load dataset 1 and dataset 2, map analysis samples in dataset 1 to dataset 2."""
 
     # select samples for analysis
-    samples1 = parse_sample(prefix1, fmt1)
-    samples2 = parse_sample(prefix2, fmt2)
+    sample_path1 = _resolve_files(prefix1, fmt1)[2]
+    sample_path2 = _resolve_files(prefix2, fmt2)[2]
+    samples1 = parse_sample(sample_path1, fmt1)
+    samples2 = parse_sample(sample_path2, fmt2)
     if keep is None:
         samples_ld = select_samples(samples1, samples2)
     else:
         samples_ld = select_samples(samples1, samples2, read_keep_file(keep))
 
-    # find subset idx
+    # find subset idx; np.flatnonzero keeps them increasing, which pgenlib requires
     sample_subset1 = np.flatnonzero(np.isin(samples1, samples_ld)).astype(np.uint32)
     sample_subset2 = np.flatnonzero(np.isin(samples2, samples_ld)).astype(np.uint32)
 
-    # map subset 1 to subset 2 for same samples
+    # map subset 1 to subset 2 for the same samples
     # since more query on dataset 2, we use its order to speed up mapping
     # idx_bridge is samples1[sample_subset1][idx_bridge] == samples2[sample_subset2]
-    subset1_id2pos = {id: i for i, id in enumerate(samples1[sample_subset1].tolist())}
-    idx_bridge = np.array([subset1_id2pos[id] for id in samples2[sample_subset2].tolist()], dtype=np.uint32)
+    subset1_id2pos = {sid: i for i, sid in enumerate(samples1[sample_subset1].tolist())}
+    idx_bridge = np.array(
+        [subset1_id2pos[sid] for sid in samples2[sample_subset2].tolist()], dtype=np.uint32
+    )
 
     # load dataset 1
-    # dataset 1 alwasy query by id, build index here
+    # dataset 1 always query by id, build index here
     logger.info("loading dataset 1: %s", prefix1)
     ds1 = load_dataset(prefix1, fmt1, samples1, dosage1, sample_subset1, idx_bridge)
     ds1.build_vid_index()
@@ -322,8 +364,7 @@ def load_dataset(
     """Open a dataset and read its variant metadata.
 
     When ``sample_subset`` is given the reader is created with that subset so that
-    downstream reads honor it; otherwise the reader spans all samples (the subset
-    can be applied later with :meth:`pgenlib.PgenReader.change_sample_subset`).
+    downstream reads honor it; otherwise the reader spans all samples.
     """
 
     genotype_path, variant_path, sample_path = _resolve_files(prefix, fmt)
@@ -338,18 +379,18 @@ def load_dataset(
         )
 
     chrom: list[str] = []
-    pos = list[int] = []
+    pos: list[int] = []
     ids: list[str] = []
     ref: list[str] = []
     alt: list[str] = []
     for i in range(variant_ct):
-        # TODO: keep using bytes here? only decode when need to print
+        # TODO: keep using bytes for ref and alt here? only decode when need to print
         chrom.append(pvar.get_variant_chrom(i).decode())
         pos.append(pvar.get_variant_pos(i))
         ids.append(pvar.get_variant_id(i).decode())
         ref.append(pvar.get_allele_code(i, 0).decode())
         alt.append(pvar.get_allele_code(i, 1).decode())
-    pos = np.array(pos, dtype=np.uint32)
+    pos_array = np.array(pos, dtype=np.uint32)
 
     is_bed = genotype_path.endswith(".bed")
     reader_kwargs: dict = {"sample_subset": sample_subset}
@@ -372,14 +413,14 @@ def load_dataset(
         variant_path=variant_path,
         sample_path=sample_path,
         sample_ids=sample_ids,
-        sample_subset=sample_subset,
-        dosage=dosage,
         chrom=chrom,
-        pos=pos,
+        pos=pos_array,
         ids=ids,
         ref=ref,
         alt=alt,
+        sample_subset=sample_subset,
         idx_bridge=idx_bridge,
+        dosage=dosage,
         _reader=reader,
         _pvar=pvar,
     )
@@ -400,15 +441,15 @@ def load_dataset(
     return ds
 
 
-def read_ld_snps(ld_snps_str: str) -> list[int]:
+def read_ld_snps(ld_snps_str: str) -> list[str]:
     """Resolve ``--ld-snps`` (comma-separated IDs)."""
 
     ids: list[str] = []
-    for id in ld_snps_str.split(","):
-        id = id.strip()
-        if not id:
+    for vid in ld_snps_str.split(","):
+        vid = vid.strip()
+        if not vid:
             continue
-        ids.append(id)
+        ids.append(vid)
     return ids
 
 
@@ -433,7 +474,7 @@ def resolve_targets(
 ) -> list[int]:
     """Resolve the dataset-1 target variants, warning about anything unmatched."""
 
-    ids = list[str] = []
+    ids: list[str] = []
     indices: list[int] = []
     seen: set[int] = set()
     if single is not None:
@@ -463,46 +504,58 @@ def candidate_indices(
     target_index: int,
     window_kb: float,
     window_count: int,
-    kept_indices: np.ndarray | None = None,
-) -> np.ndarray:
+    kept_indices: npt.NDArray[np.uint32] | None = None,
+) -> npt.NDArray[np.uint32]:
     """Dataset-2 variant indexes within the target's window.
 
-    ``window_count`` is the maximum number of dataset-2 variants (by file order
-    over the post-filter set) on both side of the target; ``0`` means no limit.
+    ``window_count`` is the maximum number of dataset-2 variants kept, chosen as
+    the nearest by absolute position distance (``0`` means no limit). Only
+    ``kept_indices`` (the post-filter variants) are eligible. The returned
+    indexes are unique and ascending, which is what ``pgenlib`` prefers.
     """
-    # TODO:
-    # make sure returned index is sorted and deduplicated
-    # which may be required by pgenlib in the future
+
     chrom = ds1.chrom[target_index]
-    pos = int(ds1.pos[target_index])
-    if window_kb < 0:
-        lo, hi = 0, np.iinfo(np.uint32).max
+    pos_a = int(ds1.pos[target_index])
+
+    entry = ds2.get_sorted_index(chrom)
+    if entry is None:
+        return np.empty(0, dtype=np.uint32)
+    pos_sorted, idx_sorted = entry
+
+    if kept_indices is None:
+        keep = np.ones(idx_sorted.size, dtype=bool)
     else:
+        kept_mask = np.zeros(ds2.variant_ct, dtype=bool)
+        kept_mask[kept_indices] = True
+        keep = kept_mask[idx_sorted]
+    pos_k = pos_sorted[keep]
+    idx_k = idx_sorted[keep]
+
+    if window_kb >= 0 and pos_k.size:
         span = window_kb * 1000
-        lo, hi = pos - span, pos + span
+        lo = int(np.searchsorted(pos_k, pos_a - span, side="left"))
+        hi = int(np.searchsorted(pos_k, pos_a + span, side="right"))
+        pos_k = pos_k[lo:hi]
+        idx_k = idx_k[lo:hi]
 
-    base = np.asarray(
-        kept_indices if kept_indices is not None else np.arange(ds2.variant_ct),
-        dtype=np.uint32,
-    )
-    target_rank = int(np.searchsorted(base, target_index))
-    if target_rank >= base.size or int(base[target_rank]) != int(target_index):
-        # The target's positional counterpart was filtered out of dataset 2, so it
-        # cannot appear in the window: anchor just left of its insertion point.
-        anchor = target_rank - 1
-    else:
-        anchor = target_rank
+    if window_count > 0 and idx_k.size > window_count:
+        distance = np.abs(pos_k.astype(np.int64) - pos_a)
+        order = np.argsort(distance, kind="stable")[:window_count]
+        idx_k = idx_k[order]
 
-    if window_count > 0:
-        # At most ``window_count`` kept variants on each side of the target's
-        # own column (which itself counts as neither).
-        first = max(0, anchor - window_count)
-        last = min(base.size, anchor + window_count + 1)
-        window = base[first:last]
-    else:
-        window = base
+    return np.unique(idx_k)
 
-    same_chrom = np.array([ds2.chrom[i] == chrom for i in window], dtype=bool)
-    in_range = same_chrom & (ds2.pos[window] >= lo) & (ds2.pos[window] <= hi)
-    return window[in_range]
 
+__all__ = [
+    "PlinkDataset",
+    "PlinkIOError",
+    "candidate_indices",
+    "load_dataset",
+    "load_two_datasets",
+    "parse_sample",
+    "read_keep_file",
+    "read_ld_snp_list",
+    "read_ld_snps",
+    "resolve_targets",
+    "select_samples",
+]

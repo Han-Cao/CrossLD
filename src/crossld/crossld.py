@@ -11,17 +11,22 @@ from dataclasses import dataclass, field
 import numpy as np
 
 from . import __version__
-from .blocks import BlockStats, BlockReader
-from .ld import SKIP_MISSING, SKIP_SAME_ID, SKIP_ZERO_VARIANCE, major_allele_flipped
-from .ld import pearson_pairwise
+from .blocks import BlockReader
+from .ld import (
+    SKIP_MISSING,
+    SKIP_SAME_ID,
+    SKIP_ZERO_VARIANCE,
+    major_allele_flipped,
+    major_allele_flipped_sparse,
+    pearson_pairwise_block,
+)
 from .logging_setup import LOGGER_NAME, configure_logging
 from .plinkio import (
-    CrossLDError,
-    Dataset,
+    PlinkDataset,
+    PlinkIOError,
     candidate_indices,
-    load_dataset,
+    load_two_datasets,
     resolve_targets,
-    select_samples,
 )
 from .results import write_header, write_row
 from .varfilter import VariantFilter
@@ -31,14 +36,14 @@ logger = logging.getLogger(f"{LOGGER_NAME}.crossld")
 DEFAULT_LD_WINDOW = 1000
 DEFAULT_LD_WINDOW_KB = 1000.0
 DEFAULT_LD_WINDOW_R2 = 0.2
-DEFAULT_BLOCK_SIZE = 16384
+DEFAULT_BLOCK_SIZE = 200
 
 
 class _Parser(argparse.ArgumentParser):
     """ArgumentParser that reports errors through the module logger."""
 
     def error(self, message: str):  # pragma: no cover - exercised via CLI tests
-        raise CrossLDError(message)
+        raise PlinkIOError(message)
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -63,7 +68,7 @@ def build_parser() -> argparse.ArgumentParser:
     target.add_argument(
         "--ld-snps",
         metavar="LIST",
-        help="comma-separated dataset-1 variant IDs and/or CHR:START-END ranges",
+        help="comma-separated dataset-1 target variant IDs",
     )
     target.add_argument(
         "--ld-snp-list",
@@ -92,7 +97,7 @@ def build_parser() -> argparse.ArgumentParser:
         default=DEFAULT_LD_WINDOW,
         metavar="N",
         help=(
-            "max number of dataset-2 variants on each side of the target "
+            "max number of dataset-2 variants nearest to the target "
             "(0 disables the count limit; default %(default)s)"
         ),
     )
@@ -132,18 +137,6 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--out", metavar="FILE", default=None, help="output file (default: stdout)")
     parser.add_argument(
-        "--sparse",
-        choices=("auto", "never", "require"),
-        default="auto",
-        help="sparse genotype/dosage reads (default %(default)s)",
-    )
-    parser.add_argument(
-        "--sample-id",
-        choices=("iid", "fid-iid"),
-        default="iid",
-        help="sample IDs used for matching, for .fam-based inputs (default %(default)s)",
-    )
-    parser.add_argument(
         "--block-size",
         type=int,
         default=DEFAULT_BLOCK_SIZE,
@@ -178,7 +171,7 @@ def validate_args(args: argparse.Namespace) -> None:
     if args.block_size < 1:
         errors.append("--block-size must be a positive integer")
     if errors:
-        raise CrossLDError("; ".join(errors))
+        raise PlinkIOError("; ".join(errors))
 
 
 @dataclass
@@ -207,26 +200,20 @@ def run(args: argparse.Namespace) -> int:
     )
     variant_filter.validate()
 
-    fid_iid = args.sample_id == "fid-iid"
     dosage1 = args.dosage or args.dosage1
     dosage2 = args.dosage or args.dosage2
     # With --r the coding allele is reported for each side, so the column name
     # depends on the orientation mode.
     allele_label = "REF" if args.ref_based else "MAJ"
 
-    ds1 = load_dataset(
+    ds1, ds2 = load_two_datasets(
         args.bfile1 or args.pfile1,
-        "dataset1",
         "bfile" if args.bfile1 else "pfile",
-        dosage=dosage1,
-        fid_iid=fid_iid,
-    )
-    ds2 = load_dataset(
+        dosage1,
         args.bfile2 or args.pfile2,
-        "dataset2",
         "bfile" if args.bfile2 else "pfile",
-        dosage=dosage2,
-        fid_iid=fid_iid,
+        dosage2,
+        keep=args.keep,
     )
 
     try:
@@ -235,11 +222,7 @@ def run(args: argparse.Namespace) -> int:
             if variant_filter.active
             else np.ones(ds2.variant_ct, dtype=bool)
         )
-        kept_indices = np.flatnonzero(mask).astype(np.int64)
-
-        subset1, subset2, _ = select_samples(ds1, ds2, keep=args.keep, fid_iid=fid_iid)
-        ds1.set_sample_subset(subset1)
-        ds2.set_sample_subset(subset2)
+        kept_indices = np.flatnonzero(mask).astype(np.uint32)
 
         targets = resolve_targets(
             ds1,
@@ -249,7 +232,6 @@ def run(args: argparse.Namespace) -> int:
         )
         if not targets:
             logger.warning("no dataset-1 target variants resolved; nothing to do")
-            logger.info("done: 0 targets, 0 pairs written")
 
         with _open_output(args.out) as out:
             write_header(out, args.with_r, allele_label)
@@ -281,8 +263,8 @@ class _Stdout:
 
 def _process_targets(
     args: argparse.Namespace,
-    ds1: Dataset,
-    ds2: Dataset,
+    ds1: PlinkDataset,
+    ds2: PlinkDataset,
     targets: list[int],
     kept_indices: np.ndarray,
     out,
@@ -292,24 +274,28 @@ def _process_targets(
     total = len(targets)
     written_total = 0
     r2_threshold = args.ld_window_r2
-    reader1 = BlockReader(ds1, sparse="never", dosage=bool(ds1._dosage))
-    reader2 = BlockReader(ds2, sparse=args.sparse, dosage=bool(ds2._dosage))
+    ref_based = args.ref_based
+    reader1 = BlockReader(ds1, dosage=bool(ds1.dosage), force_dense=True)
+    reader2 = BlockReader(ds2, dosage=bool(ds2.dosage))
+    bridge = ds1.idx_bridge
 
-    # Orient each dataset-1 target once; the values do not depend on the pairing.
-    # The coding allele is recorded alongside so --r can report it.
+    # Orient each dataset-1 target once. The coding allele is recorded alongside
+    # so --r can report it; no matrix/vector recoding is done for r itself.
     target_vectors: dict[int, np.ndarray] = {}
     target_alleles: dict[int, str] = {}
+    target_signs: dict[int, float] = {}
     for index in targets:
-        matrix, _ = reader1.read([index])
-        vector = matrix[0]
-        if args.ref_based:
+        raw = reader1.read([index]).dense[0].astype(np.float64)
+        if ref_based:
             target_alleles[index] = ds1.ref[index]
-        elif major_allele_flipped(vector):
+            target_signs[index] = 1.0
+        elif major_allele_flipped(raw):
             target_alleles[index] = ds1.ref[index]
-            vector = _to_ref(vector)
+            target_signs[index] = -1.0
         else:
             target_alleles[index] = ds1.alt[index]
-        target_vectors[index] = vector
+            target_signs[index] = 1.0
+        target_vectors[index] = raw[bridge] if bridge is not None else raw
 
     for order, index in enumerate(targets, start=1):
         start_time = time.perf_counter()
@@ -327,33 +313,32 @@ def _process_targets(
             args.ld_window,
             kept_indices=kept_indices,
         )
-        progress.candidates = int(len(candidates))
+        progress.candidates = len(candidates)
         rows: list[tuple] = []
         target = target_vectors[index]
+        sign_a = target_signs[index]
 
         if len(candidates) == 0:
-            logger.debug(
-                "target %s: window holds no dataset-2 variants", ds1.ids[index]
-            )
+            logger.debug("target %s: window holds no dataset-2 variants", ds1.ids[index])
 
         block_total = max(1, -(-len(candidates) // block_size)) if len(candidates) else 0
         for block_no, (start, end) in enumerate(_block_slices(len(candidates), block_size), start=1):
             chunk = candidates[start:end]
-            matrix, block_stats = reader2.read(chunk)
-            # The coding allele per dataset-2 variant, for the --r allele column.
-            block_alleles = _coding_alleles(ds2, chunk, matrix, allele_label)
-            if not args.ref_based:
-                flips = np.array([major_allele_flipped(matrix[i]) for i in range(len(chunk))])
-                matrix = np.where(
-                    flips[:, None] & (matrix >= 0), 2.0 - matrix, matrix
-                )
-            r_values, _ = pearson_pairwise(target, matrix)
+            block = reader2.read(chunk)
+            block_stats = block.stats
             block_stats.block_index = block_no
             block_stats.block_total = block_total
+
+            r_values, n_values = pearson_pairwise_block(target, block)
+            if args.with_r:
+                signs_b, alleles_b = _block_allele_info(ds2, chunk, block, allele_label)
+            else:
+                signs_b, alleles_b = None, [""] * len(chunk)
+
             for row_offset, var_index in enumerate(chunk):
                 r = float(r_values[row_offset])
                 if not np.isfinite(r):
-                    reason = _skip_reason(target, matrix[row_offset])
+                    reason = SKIP_MISSING if int(n_values[row_offset]) < 3 else SKIP_ZERO_VARIANCE
                 elif ds1.ids[index] == ds2.ids[var_index]:
                     reason = SKIP_SAME_ID
                 else:
@@ -363,11 +348,15 @@ def _process_targets(
                     block_stats.skipped += 1
                     progress.skip_reasons[reason] = progress.skip_reasons.get(reason, 0) + 1
                     continue
+
+                r_report = r
+                if args.with_r and not ref_based:
+                    r_report = r * sign_a * signs_b[row_offset]
                 r2 = r * r
                 # 0 doubles as "no filter"; any non-zero threshold keeps pairs
                 # whose r^2 is at least that large.
                 if r2_threshold == 0.0 or r2 >= r2_threshold:
-                    rows.append((var_index, r, r2, block_alleles[row_offset]))
+                    rows.append((var_index, r_report, r2, alleles_b[row_offset]))
                     progress.kept += 1
                     block_stats.kept += 1
                 else:
@@ -377,30 +366,30 @@ def _process_targets(
             progress.blocks += 1
             logger.debug(
                 "block %d/%d variants=%d rows=%d-%d samples=%d mode=%s "
-                "sparse_variants=%d sparse_fallbacks=%d pairs_evaluated=%d "
-                "pairs_kept=%d pairs_below_r2=%d pairs_skipped=%d missing_frac=%.4f "
-                "elapsed=%.3fs",
+                "dense_variants=%d sparse_variants=%d pairs_evaluated=%d "
+                "pairs_kept=%d pairs_below_r2=%d pairs_skipped=%d elapsed=%.3fs",
                 block_stats.block_index,
                 max(block_stats.block_total, 1),
-                len(chunk),
+                block_stats.variants,
                 int(chunk[0]) if len(chunk) else -1,
                 int(chunk[-1]) if len(chunk) else -1,
                 len(target),
                 block_stats.mode,
+                block_stats.dense_variants,
                 block_stats.sparse_variants,
-                block_stats.sparse_fallbacks,
                 block_stats.pairs_evaluated,
                 block_stats.kept,
                 block_stats.below_r2,
                 block_stats.skipped,
-                block_stats.missing_frac,
                 time.perf_counter() - start_time,
             )
 
         if rows:
-            order_idx = np.argsort(np.array([ds2.pos[r[0]] for r in rows], dtype=np.int64), kind="stable")
+            order_idx = np.argsort(
+                np.array([ds2.pos[r[0]] for r in rows], dtype=np.int64), kind="stable"
+            )
             for position in order_idx:
-                var_index, r, r2, allele_b = rows[position]
+                var_index, r_report, r2, allele_b = rows[position]
                 write_row(
                     out,
                     with_r=args.with_r,
@@ -410,7 +399,7 @@ def _process_targets(
                     chrom_b=ds2.chrom[var_index],
                     pos_b=int(ds2.pos[var_index]),
                     id_b=ds2.ids[var_index],
-                    r=r,
+                    r=r_report,
                     r2=r2,
                     allele_label=allele_label,
                     allele_a=target_alleles[index],
@@ -442,10 +431,6 @@ def _process_targets(
     return written_total
 
 
-def _to_ref(values: np.ndarray) -> np.ndarray:
-    return np.where(values < 0, values, 2.0 - values)
-
-
 def _block_slices(total: int, block_size: int):
     start = 0
     while start < total:
@@ -453,32 +438,40 @@ def _block_slices(total: int, block_size: int):
         start += block_size
 
 
-def _coding_alleles(
-    dataset: Dataset,
+def _block_allele_info(
+    dataset: PlinkDataset,
     chunk: np.ndarray,
-    raw_matrix: np.ndarray,
+    block,
     allele_label: str,
-) -> list[str]:
-    """The allele each dataset-2 variant is coded by, for the ``--r`` output.
+) -> tuple[np.ndarray | None, list[str]]:
+    """Per-row major-allele sign and coding allele for a block.
 
-    ``allele_label`` is ``"REF"`` for ``--ref-based`` and ``"MAJ"`` for the
-    default major-allele orientation (which mirrors the ALT counts when ALT is
-    not the major allele). ``raw_matrix`` must hold the un-mirrored ALT counts.
+    In ``REF`` mode the reported r needs no sign adjustment
+    (``signs`` is ``None``); in ``MAJ`` mode ``signs`` is ``-1`` for rows whose
+    ALT allele is the minor allele (i.e. the row must be mirrored to be
+    major-allele coded).
     """
 
     if allele_label == "REF":
-        return [dataset.ref[int(i)] for i in chunk]
-    return [
-        dataset.ref[int(i)] if major_allele_flipped(raw_matrix[row]) else dataset.alt[int(i)]
-        for row, i in enumerate(chunk)
-    ]
+        return None, [dataset.ref[int(i)] for i in chunk]
 
+    sample_ct = dataset.active_sample_ct
+    signs = np.ones(len(chunk), dtype=np.float64)
+    alleles = [""] * len(chunk)
 
-def _skip_reason(target: np.ndarray, other: np.ndarray) -> str:
-    valid = (target >= 0) & (other >= 0)
-    if int(valid.sum()) < 3:
-        return SKIP_MISSING
-    return SKIP_ZERO_VARIANCE
+    for row, position in enumerate(block.dense_rows.tolist()):
+        flipped = major_allele_flipped(block.dense[row])
+        signs[position] = -1.0 if flipped else 1.0
+        index = int(chunk[position])
+        alleles[position] = dataset.ref[index] if flipped else dataset.alt[index]
+
+    for row, position in enumerate(block.sparse_rows.tolist()):
+        flipped = major_allele_flipped_sparse(block.sparse_values[row], sample_ct)
+        signs[position] = -1.0 if flipped else 1.0
+        index = int(chunk[position])
+        alleles[position] = dataset.ref[index] if flipped else dataset.alt[index]
+
+    return signs, alleles
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -492,7 +485,7 @@ def main(argv: list[str] | None = None) -> int:
             level = logging.WARNING
         configure_logging(level)
         return run(args)
-    except CrossLDError as exc:
+    except (PlinkIOError, OSError) as exc:
         logging.getLogger(LOGGER_NAME).error("%s", exc)
         return 2
 

@@ -6,17 +6,18 @@ their own handlers or use ``caplog`` because :func:`configure_logging` never cal
 ``logging.basicConfig``.
 """
 
-from __future__ import annotations
-
 import logging
 import sys
 
 LOGGER_NAME = "crossld"
 DEFAULT_LEVEL = logging.INFO
-FORMAT = "%(levelname)s [%(name)s] %(message)s"
+DEFAULT_FORMAT = logging.Formatter(
+        '[%(asctime)s] - [%(levelname)s]: %(message)s',
+        datefmt='%Y-%m-%d %H:%M:%S'
+    )
 
 
-def configure_logging(level: int | str | None = None, stream=None) -> logging.Logger:
+def configure_logging(level = None, stream=None) -> logging.Logger:
     """Return the package logger, configured once with a stderr handler.
 
     Repeated calls are idempotent: the level is updated in place and no duplicate
@@ -25,8 +26,6 @@ def configure_logging(level: int | str | None = None, stream=None) -> logging.Lo
 
     if level is None:
         level = DEFAULT_LEVEL
-    if isinstance(level, str):
-        level = logging.getLevelName(level.upper())
 
     logger = logging.getLogger(LOGGER_NAME)
     logger.setLevel(level)
@@ -40,7 +39,7 @@ def configure_logging(level: int | str | None = None, stream=None) -> logging.Lo
     if handler is None:
         handler = logging.StreamHandler(sys.stderr if stream is None else stream)
         handler._crossld_handler = True  # type: ignore[attr-defined]
-        handler.setFormatter(logging.Formatter(FORMAT))
+        handler.setFormatter(DEFAULT_FORMAT)
         logger.addHandler(handler)
     handler.setLevel(level)
     return logger
