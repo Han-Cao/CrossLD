@@ -121,7 +121,7 @@ class PlinkDataset:
             )
         self._variant_mask = mask
         logger.debug(
-            "dataset: variant filter kept %d of %d variants",
+            "Kept %d of %d variants after variant filter",
             int(mask.sum()),
             self.variant_ct,
         )
@@ -289,7 +289,7 @@ def select_samples(
         samples_ld = dataset_overlap
 
     logger.info(
-        "samples: dataset1=%d dataset2=%d shared=%d%s",
+        "Parsed samples: dataset1=%d dataset2=%d shared=%d%s",
         len(samples1),
         len(samples2),
         len(dataset_overlap),
@@ -368,17 +368,20 @@ def load_two_datasets(
     sample_subset1 = np.flatnonzero(np.isin(samples1, samples_ld)).astype(np.uint32)
     sample_subset2 = np.flatnonzero(np.isin(samples2, samples_ld)).astype(np.uint32)
 
-    # map subset 1 to subset 2 for the same samples
+    # map subset 1 to subset 2 for the same samples if they have different order
     # since more query on dataset 2, we use its order to speed up mapping
     # idx_bridge is samples1[sample_subset1][idx_bridge] == samples2[sample_subset2]
-    subset1_id2pos = {sid: i for i, sid in enumerate(samples1[sample_subset1].tolist())}
-    idx_bridge = np.array(
-        [subset1_id2pos[sid] for sid in samples2[sample_subset2].tolist()], dtype=np.uint32
-    )
+    if np.array_equal(samples1[sample_subset1], samples2[sample_subset2]):
+        idx_bridge = None
+    else:
+        subset1_id2pos = {sid: i for i, sid in enumerate(samples1[sample_subset1].tolist())}
+        idx_bridge = np.array(
+            [subset1_id2pos[sid] for sid in samples2[sample_subset2].tolist()], dtype=np.uint32
+        )
 
     # load dataset 1
     # dataset 1 always query by id, build index here
-    logger.info("loading dataset 1: %s", prefix1)
+    logger.info("Loading dataset 1: %s", prefix1)
     ds1 = load_dataset(
         prefix1, fmt1, samples1, dosage1, sample_subset1, idx_bridge,
     )
@@ -387,7 +390,7 @@ def load_two_datasets(
     # load dataset 2
     # dataset 2 always query by position, sort it here
     # varfilter will also query by id, so build vid index later when needed
-    logger.info("loading dataset 2: %s", prefix2)
+    logger.info("Loading dataset 2: %s", prefix2)
     ds2 = load_dataset(
         prefix2, fmt2, samples2, dosage2, sample_subset2,
     )
@@ -464,16 +467,13 @@ def load_dataset(
     )
 
     logger.info(
-        "dataset: format=%s variants=%d samples=%d genotype=%s",
+        "format=%s variants=%d samples=%d",
         fmt,
         variant_ct,
         len(sample_ids),
-        genotype_path,
     )
     logger.debug(
-        "dataset: variant-meta=%s sample-meta=%s chroms=%s",
-        variant_path,
-        sample_path,
+        "chroms=%s",
         sorted(set(chrom)),
     )
     return ds
@@ -531,6 +531,8 @@ def resolve_targets(
             n_miss += 1
             continue
         indices.append(index)
+    # sort indices to respect the variant order in dataset 1
+    indices.sort()
     if n_miss > 0:
         logger.warning("%d target LD variants not found in dataset 1", n_miss)
     return indices

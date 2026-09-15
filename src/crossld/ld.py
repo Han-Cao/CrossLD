@@ -175,7 +175,7 @@ def pearson_pairwise_sparse(
     return r_out, n_out
 
 
-def pearson_pairwise_block(target: npt.NDArray, block: BlockMatrix) -> tuple[npt.NDArray, npt.NDArray]:
+def pearson_pairwise_block(target: npt.NDArray, block: BlockMatrix) -> tuple[npt.NDArray[np.float64], npt.NDArray[np.uint32]]:
     """Pearson r between ``target`` and a :class:`crossld.blocks.BlockMatrix`.
 
     Returns ``(r, n)`` aligned with the block's requested row order (dense and

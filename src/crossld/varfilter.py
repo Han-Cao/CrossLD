@@ -70,6 +70,7 @@ class VariantFilter:
         else:
             return np.ones(ds.variant_ct, dtype=bool)
 
+        logger.info("Filtering variants in dataset 2:")
         if self.extract:
             idx_extract, matched, requested = _match_variant_indices(
                 ds, read_vid_file(self.extract)
@@ -98,14 +99,9 @@ class VariantFilter:
                 "dataset-2 variant filtering left no variants; check the filter file"
             )
         logger.info(
-            "variant-filter: %s kept %d variants",
+            "%s kept %d variants",
             self.describe(),
             kept
-        )
-        logger.debug(
-            "variant-filter: dataset-2 total=%d kept=%d",
-            ds.variant_ct,
-            kept,
         )
         return mask
 
@@ -165,7 +161,7 @@ def read_vid_file(path: str) -> list[str]:
             if not stripped or stripped.startswith("#"):
                 continue
             ids.append(stripped.split()[0])
-    logger.debug("id-file %s: %d ID(s)", path, len(ids))
+    logger.debug("--extract %s: %d ID(s)", path, len(ids))
     return ids
 
 
