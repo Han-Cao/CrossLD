@@ -1,157 +1,210 @@
-"""Unit tests for the block-wise reader in :mod:`crossld.blocks`."""
+"""Unit tests for the block-wise reader in :mod:`crossld.blocks`.
+
+Synthetic ``.pgen`` data is used so the dense/sparse partition is deterministic:
+``pgenlib`` stores a variant in the sparse format when only a couple of samples
+carry a non-reference call (verified for ``PgenWriter``), which lets each test
+pick exactly which rows land in ``dense`` and which in ``sparse``.
+"""
 
 from __future__ import annotations
 
 import numpy as np
 import pytest
 
-from crossld.blocks import BlockReader
-from crossld.plinkio import load_dataset, select_samples
+from crossld.blocks import MISSING, BlockReader, BlockStats
+from crossld.plinkio import load_dataset
+from tests.conftest import make_bfile, make_dosage_pfile, make_pfile
+
+SAMPLE_IDS = [f"S{i}" for i in range(20)]
+
+# v0/v2/v4 are sparse-eligible (<=2 non-reference calls out of 20), v1/v3/v5 are
+# dense (pgenlib only stores very sparse variants in the sparse format).
+GENOTYPES = np.array(
+    [
+        [0] * 20,  # 0 sparse, constant REF
+        [0, 0, 1, 1, 2, 2] + [0] * 14,  # 1 dense
+        [2] + [0] * 19,  # 2 sparse, single ALT
+        ([0, 1, 0, 2, 0, 1, 0, 2] * 2) + [0] * 4,  # 3 dense
+        [2] + [0] * 18 + [-9],  # 4 sparse, ALT + missing
+        [1] * 20,  # 5 dense, constant het
+    ],
+    dtype=np.int8,
+)
+VARIANTS = [
+    ("1", f"1:{100 * (i + 1)}:A:G", 100 * (i + 1), "A", "G")
+    for i in range(GENOTYPES.shape[0])
+]
+SPARSE_VARIANTS = [0, 2, 4]
+DENSE_VARIANTS = [1, 3, 5]
 
 
-@pytest.fixture(scope="module")
-def loaded(sample1_prefix, sample2_prefix):
-    ds1 = load_dataset(sample1_prefix, "dataset1", "pfile")
-    ds2 = load_dataset(sample2_prefix, "dataset2", "pfile")
-    subset1, subset2, _ = select_samples(ds1, ds2)
-    ds1.set_sample_subset(subset1)
-    ds2.set_sample_subset(subset2)
-    yield ds1, ds2
-    ds1.close()
-    ds2.close()
+def _load(tmp_path, name="blocks", genotypes=GENOTYPES, variants=VARIANTS, **kwargs):
+    prefix = make_pfile(tmp_path, name, genotypes, SAMPLE_IDS, variants)
+    return load_dataset(prefix, "pfile", np.array(SAMPLE_IDS), **kwargs)
 
 
-def _sparse_eligible(dataset) -> list[int]:
-    return [
-        i
-        for i in range(dataset.variant_ct)
-        if dataset.reader.has_sparse(i)
-    ]
+def _reconstruct(block, sample_ct: int) -> np.ndarray:
+    """Rebuild the full matrix from the dense/sparse split."""
+
+    out = np.zeros((block.stats.variants, sample_ct), dtype=np.float64)
+    if block.dense_rows.size:
+        out[block.dense_rows] = block.dense
+    for i, position in enumerate(block.sparse_rows.tolist()):
+        out[position, block.sparse_sample_idxs[i]] = block.sparse_values[i]
+    return out
 
 
-def test_sparse_and_dense_agree_per_variant(loaded):
-    ds1, _ = loaded
-    eligible = _sparse_eligible(ds1)
-    assert eligible, "fixture should contain at least one sparse-eligible variant"
-
-    sparse_reader = BlockReader(ds1, sparse="auto")
-    dense_reader = BlockReader(ds1, sparse="never")
-    for index in eligible[:20]:
-        sparse_matrix, sparse_stats = sparse_reader.read([index])
-        dense_matrix, _ = dense_reader.read([index])
-        assert sparse_stats.sparse_variants == 1
-        assert sparse_stats.sparse_fallbacks == 0
-        np.testing.assert_array_equal(sparse_matrix, dense_matrix)
-
-
-def test_dense_fallback_on_non_sparse_variant(loaded):
-    ds1, _ = loaded
-    non_sparse = [i for i in range(ds1.variant_ct) if not ds1.reader.has_sparse(i)]
-    assert non_sparse
-    reader = BlockReader(ds1, sparse="auto")
-    matrix, stats = reader.read([non_sparse[0]])
-    assert stats.sparse_fallbacks == 1
-    assert stats.sparse_variants == 0
-    dense_matrix, _ = BlockReader(ds1, sparse="never").read([non_sparse[0]])
-    np.testing.assert_array_equal(matrix, dense_matrix)
+def test_sparse_partition_and_row_mapping(tmp_path):
+    ds = _load(tmp_path)
+    try:
+        block = BlockReader(ds).read([0, 1, 2, 3, 4, 5])
+        assert list(block.dense_rows) == DENSE_VARIANTS
+        assert list(block.sparse_rows) == SPARSE_VARIANTS
+        assert block.stats.variants == 6
+        assert block.stats.dense_variants == 3
+        assert block.stats.sparse_variants == 3
+        assert block.stats.mode == "hardcall"
+        assert block.stats.block_index == 1 and block.stats.block_total == 1
+        # Dense rows follow dense_rows order.
+        np.testing.assert_array_equal(
+            block.dense, GENOTYPES[DENSE_VARIANTS].astype(np.int8)
+        )
+    finally:
+        ds.close()
 
 
-def test_sparse_require_raises_for_non_sparse_variant(loaded):
-    ds1, _ = loaded
-    non_sparse = [i for i in range(ds1.variant_ct) if not ds1.reader.has_sparse(i)]
-    with pytest.raises(RuntimeError):
-        BlockReader(ds1, sparse="require").read([non_sparse[0]])
+def test_sparse_and_dense_reads_agree(tmp_path):
+    ds = _load(tmp_path)
+    try:
+        for index in range(ds.variant_ct):
+            block = BlockReader(ds).read([index])
+            dense = BlockReader(ds, force_dense=True).read([index]).dense
+            np.testing.assert_array_equal(
+                _reconstruct(block, ds.active_sample_ct), dense
+            )
+    finally:
+        ds.close()
 
 
-def test_explicit_flip_applies_to_dense_reads(loaded):
-    ds1, _ = loaded
-    reader = BlockReader(ds1, sparse="never")
-    plain, _ = reader.read([0])
-    flipped, _ = reader.read([0], flip=np.array([True]))
-    expected = np.where(plain >= 0, 2.0 - plain, plain)
-    np.testing.assert_allclose(flipped, expected)
+def test_sparse_preserves_missing_and_nonzero_calls(tmp_path):
+    ds = _load(tmp_path)
+    try:
+        block = BlockReader(ds).read([4])
+        assert list(block.sparse_rows) == [0]
+        values = block.sparse_values[0]
+        assert MISSING in values  # the listed -9 is not silently turned into 0
+        assert 2 in values
+    finally:
+        ds.close()
 
 
-def test_empty_index_list_is_allowed(loaded):
-    ds1, _ = loaded
-    matrix, stats = BlockReader(ds1).read([])
-    assert matrix.shape == (0, ds1.active_sample_ct)
-    assert stats.variants == 0
+def test_force_dense_returns_only_dense_rows(tmp_path):
+    ds = _load(tmp_path)
+    try:
+        block = BlockReader(ds, force_dense=True).read([0, 1, 2, 3, 4, 5])
+        assert block.sparse_rows.size == 0
+        assert list(block.dense_rows) == list(range(6))
+        assert block.stats.sparse_variants == 0
+        assert block.stats.dense_variants == 6
+        np.testing.assert_array_equal(block.dense, GENOTYPES.astype(np.int8))
+    finally:
+        ds.close()
 
 
-def test_buffer_matches_active_sample_subset(loaded):
-    ds1, _ = loaded
-    matrix, _ = BlockReader(ds1).read([0])
-    assert matrix.shape == (1, ds1.active_sample_ct) == (1, 100)
+def test_bfile_is_always_dense(tmp_path):
+    prefix = make_bfile(tmp_path, "bed", GENOTYPES, SAMPLE_IDS, VARIANTS)
+    ds = load_dataset(prefix, "bfile", np.array(SAMPLE_IDS))
+    try:
+        block = BlockReader(ds).read([0, 2, 4])
+        assert block.sparse_rows.size == 0
+        assert list(block.dense_rows) == [0, 1, 2]
+        np.testing.assert_array_equal(block.dense, GENOTYPES[[0, 2, 4]])
+    finally:
+        ds.close()
 
 
-def test_dosage_reads_match_hardcalls_on_hardcall_data(loaded):
-    ds1, _ = loaded
-    hardcalls, _ = BlockReader(ds1, sparse="never", dosage=False).read([0, 1, 2])
-    dosages, stats = BlockReader(ds1, sparse="never", dosage=True).read([0, 1, 2])
-    np.testing.assert_allclose(dosages, hardcalls)
-    assert stats.mode == "dosage"
+def test_empty_index_list_is_allowed(tmp_path):
+    ds = _load(tmp_path)
+    try:
+        block = BlockReader(ds).read([])
+        assert block.stats.variants == 0
+        assert block.dense.shape == (0, ds.active_sample_ct)
+        assert block.dense_rows.size == 0 and block.sparse_rows.size == 0
+        assert block.sparse_sample_idxs == [] and block.sparse_values == []
+    finally:
+        ds.close()
+
+
+def test_buffer_matches_active_sample_subset(tmp_path):
+    ds = _load(tmp_path)
+    try:
+        assert ds.sample_ct == 20 and ds.active_sample_ct == 20
+        subset = np.array([1, 3, 5, 7], dtype=np.uint32)
+        ds_sub = _load(tmp_path, name="blocks_sub", sample_subset=subset)
+        try:
+            assert ds_sub.active_sample_ct == 4
+            block = BlockReader(ds_sub).read([1, 3])
+            assert block.dense.shape == (2, 4)
+            full = BlockReader(ds, force_dense=True).read([1, 3]).dense
+            np.testing.assert_array_equal(block.dense, full[:, subset])
+        finally:
+            ds_sub.close()
+    finally:
+        ds.close()
+
+
+def test_dosage_reads_match_hardcalls_on_hardcall_data(tmp_path):
+    ds = _load(tmp_path)
+    try:
+        reader_hard = BlockReader(ds, dosage=False)
+        reader_dos = BlockReader(ds, dosage=True)
+        hard = reader_hard.read([1, 3, 5])
+        dos = reader_dos.read([1, 3, 5])
+        np.testing.assert_allclose(dos.dense, hard.dense)
+        assert dos.stats.mode == "dosage"
+        assert reader_dos.arr_dtype == np.float32
+        assert hard.dense.dtype == np.int8 and dos.dense.dtype == np.float32
+    finally:
+        ds.close()
 
 
 def test_sparse_dosage_path_matches_dense(tmp_path):
-    from crossld.plinkio import load_dataset
-    from tests.conftest import make_dosage_pfile
-
-    samples = [f"S{i}" for i in range(8)]
-    variants = [("1", "1:100:A:G", 100, "A", "G"), ("1", "1:200:C:T", 200, "C", "T")]
     dosages = np.array(
         [
-            [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.5],
-            [0.0, 0.5, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+            [0.0] * 19 + [1.5],
+            [0.5] + [0.0] * 19,
+            [1.0, 1.0] + [0.0] * 16 + [2.0, 2.0],
         ],
         dtype=np.float32,
     )
-    prefix = make_dosage_pfile(tmp_path, "dos", dosages, samples, variants)
-    dataset = load_dataset(prefix, "dos", "pfile", dosage=True)
+    variants = [
+        ("1", f"1:{100 * (i + 1)}:A:G", 100 * (i + 1), "A", "G")
+        for i in range(dosages.shape[0])
+    ]
+    prefix = make_dosage_pfile(tmp_path, "dos", dosages, SAMPLE_IDS, variants)
+    ds = load_dataset(prefix, "pfile", np.array(SAMPLE_IDS), dosage=True)
     try:
-        sparse_reader = BlockReader(dataset, sparse="auto", dosage=True)
-        sparse_matrix, stats = sparse_reader.read([0, 1])
-        dense_matrix, _ = BlockReader(dataset, sparse="never", dosage=True).read([0, 1])
-        np.testing.assert_allclose(sparse_matrix, dense_matrix)
-        assert stats.sparse_variants + stats.sparse_fallbacks >= 1
+        assert any(ds.reader.has_sparse_dosages(i) for i in range(ds.variant_ct))
+        block = BlockReader(ds, dosage=True).read([0, 1, 2])
+        assert block.stats.sparse_variants >= 1
+        dense = BlockReader(ds, dosage=True, force_dense=True).read([0, 1, 2]).dense
+        np.testing.assert_allclose(
+            _reconstruct(block, ds.active_sample_ct), dense, atol=1e-6
+        )
     finally:
-        dataset.close()
+        ds.close()
 
 
-def test_sparse_flip_applies_to_sparse_reads(loaded):
-    ds1, _ = loaded
-    eligible = _sparse_eligible(ds1)
-    index = eligible[0]
-    plain, stats = BlockReader(ds1, sparse="auto").read([index])
-    assert stats.sparse_variants == 1
-    flipped, _ = BlockReader(ds1, sparse="auto").read([index], flip=np.array([True]))
-    expected = np.where(plain >= 0, 2.0 - plain, plain)
-    np.testing.assert_allclose(flipped, expected)
-
-
-def test_runtime_error_falls_back_to_dense(loaded):
-    ds1, _ = loaded
-    eligible = _sparse_eligible(ds1)
-    reader = BlockReader(ds1, sparse="auto")
-
-    class Boom:
-        """Proxy that advertises sparse support but fails on read."""
-
-        def __init__(self, real):
-            self._real = real
-
-        def __getattr__(self, name):
-            return getattr(self._real, name)
-
-        def has_sparse(self, variant_idx, allele_idx=1):
-            return True
-
-        def read_sparse8(self, variant_idx, allele_idx=1):
-            raise RuntimeError("no sparse representation")
-
-    reader.reader = Boom(ds1.reader)
-    matrix, stats = reader.read([eligible[0]])
-    assert stats.sparse_fallbacks == 1
-    assert stats.sparse_variants == 0
-    dense, _ = BlockReader(ds1, sparse="never").read([eligible[0]])
-    np.testing.assert_array_equal(matrix, dense)
+def test_stats_defaults_and_ordering(tmp_path):
+    ds = _load(tmp_path)
+    try:
+        stats = BlockStats()
+        assert stats.block_index == 1 and stats.block_total == 1
+        assert stats.variants == 0 and stats.mode == "hardcall"
+        block = BlockReader(ds).read([2, 0])
+        # Requested order 2, 0 is preserved in the row mapping.
+        assert list(block.sparse_rows) == [0, 1]
+        assert list(block.sparse_sample_idxs[0]) == [0]
+        assert list(block.sparse_sample_idxs[1]) == []
+    finally:
+        ds.close()

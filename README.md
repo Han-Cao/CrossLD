@@ -62,9 +62,9 @@ crossLD --bfile1 cohort --bfile2 reference --ld-snp 20:114311:G:T --ld-window-r2
 | `--dosage` / `--dosage1` / `--dosage2` | use dosages instead of hardcalls for both / one dataset |
 | `--ref-based` | orient r to REF alleles instead of each variant's major allele |
 | `--r` | report signed `UNPHASED_R` plus the coding allele per side (`MAJ_A`/`MAJ_B`, or `REF_A`/`REF_B` with `--ref-based`) instead of `UNPHASED_R2` |
-| `--block-size N` | variants read per block (default `200`) |
+| `--block-size N` | variants read per block (default `500`) |
 | `--out FILE` | output file (default: stdout) |
-| `-v` / `-q` | DEBUG / WARNING logging (default INFO) |
+| `--debug` / `--quiet` | DEBUG / WARNING logging (default INFO) |
 
 ## Output
 
@@ -87,8 +87,9 @@ The allele columns are named `MAJ_A`/`MAJ_B` for the default major-allele
 orientation and `REF_A`/`REF_B` with `--ref-based`. `--ld-window-r2` still
 filters on `r²` in either shape.
 
-Rows are emitted in `--ld-snp*` order and then by ascending dataset-2 position.
-Pairs whose two variant IDs are identical are skipped.
+Rows are emitted in dataset-1 variant order and then by ascending dataset-2
+position. A dataset-1 target that is also present in dataset 2 is correlated
+against itself and reported with `r`/`r²` of `1`.
 
 ## Conventions
 
@@ -107,6 +108,10 @@ Pairs whose two variant IDs are identical are skipped.
   columns record the allele each side is oriented to.
 * **Orientation**: variants whose REF/ALT are swapped between datasets are
   handled automatically, because each side is oriented within its own dataset.
+* **Allele metadata**: REF/ALT strings are never cached; they are decoded on
+  demand from the `.pvar`/`.bim` reader only for the rows that are actually
+  written. An `r²`-only run reports `r²` without reading any allele strings, and
+  a `--r` run only pays for its output rows.
 * **Filters**: `--extract*`/`--exclude*` apply to dataset 2 only, and the variant
   count used by `--ld-window` is measured over the surviving variants.
 * **Windows**: `--ld-window N` keeps the `N` dataset-2 variants nearest to the
@@ -132,29 +137,25 @@ Diagnostics go to **stderr**, so stdout stays a clean result stream.
 * Default (`INFO`): per-dataset summary, sample/filter summaries, one line per
   resolved target with its candidate/pair counts and elapsed time, and a final
   run summary.
-* `-v` (`DEBUG`): adds detailed per-block statistics (variant counts, index
+* `--debug` (`DEBUG`): adds detailed per-block statistics (variant counts, index
   range, read mode, dense/sparse row counts, pairs evaluated/kept/skipped,
   elapsed time), per-target plan details and skip reasons.
+* `--quiet` (`WARNING`): suppresses the INFO lines.
 
 ```
-[2026-09-14 12:00:00] - [INFO]: target 1/4 20:114311:G:T 20:114311 candidates=537 pairs_kept=230 pairs_below_r2=306 pairs_skipped=1 elapsed=0.003s
-[2026-09-14 12:00:00] - [DEBUG]: block 1/3 variants=200 rows=0-205 samples=100 mode=hardcall dense_variants=200 sparse_variants=0 pairs_evaluated=199 pairs_kept=57 pairs_below_r2=142 pairs_skipped=1 elapsed=0.001s
-[2026-09-14 12:00:00] - [INFO]: done: 4 target(s), 784 pair(s) written
+[2026-09-14 12:00:00] - [INFO]: target 1/4 20:114311:G:T 20:114311 candidates=537 pairs_kept=231 pairs_below_r2=306 pairs_skipped=0 elapsed=0.006s
+[2026-09-14 12:00:00] - [DEBUG]: block 1/3 variants=200 rows=0-205 mode=hardcall dense_variants=114 sparse_variants=86 pairs_evaluated=200 pairs_kept=58 pairs_below_r2=142 pairs_skipped=0 elapsed=0.002s
+[2026-09-14 12:00:00] - [INFO]: done: 4 target(s), 788 pair(s) written
 ```
 
 ## Development
 
 ```bash
-pytest                       # runs the suite with coverage (fail_under = 90)
-pytest --cov=crossld --cov-report=term-missing
+pytest                       # runs the whole test suite
+pytest --cov=crossld --cov-report=term-missing   # optional coverage report
 ```
 
 The layout is `src/crossld/`: `plinkio` (dataset/sample/variant resolution),
 `varfilter` (dataset-2 extraction), `blocks` (sparse-aware block reads), `ld`
 (correlation math), `results` (output formatting), `logging_setup`, and
 `crossld` (the CLI / orchestration module).
-
-Naming: the importable package is lowercase (`crossld`, so
-`import crossld.crossld`), while the user-facing program and console script keep
-the `crossLD` spelling. Test fixtures live under `tests/data/`, and the synthetic
-input builders plus fixtures are in `tests/conftest.py`.

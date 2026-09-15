@@ -1,8 +1,6 @@
-"""Tests for the output formatter and the module entry point."""
+"""Tests for the output formatter in :mod:`crossld.results`."""
 
 from __future__ import annotations
-
-import runpy
 
 import pytest
 
@@ -31,6 +29,9 @@ BASE = {
     "allele_b": "A",
 }
 
+R2_ROW = "20\t114311\t20:114311:G:T\t20\t101498\t20:101498:A:G\t0.0910081"
+R_ROW = "20\t114311\t20:114311:G:T\tG\t20\t101498\t20:101498:A:G\tA\t-0.301675"
+
 
 def test_value_format_matches_reference_precision():
     assert VALUE_FORMAT == "%.6g"
@@ -40,29 +41,38 @@ def test_value_format_matches_reference_precision():
     assert format_value(0.0505139) == "0.0505139"
 
 
+@pytest.mark.parametrize(
+    "with_r, expected",
+    [(False, R2_ROW), (True, R_ROW)],
+    ids=["r2", "r"],
+)
+def test_format_row_shapes(with_r, expected):
+    assert format_row(**BASE, with_r=with_r) == expected
+
+
 def test_r2_row_has_no_allele_columns():
-    assert format_row(**BASE, with_r=False) == (
-        "20\t114311\t20:114311:G:T\t20\t101498\t20:101498:A:G\t0.0910081"
-    )
+    assert BASE["allele_a"] not in format_row(**BASE, with_r=False).split("\t")
 
 
-def test_r_row_reports_alleles_without_r2():
-    expected = (
-        "20\t114311\t20:114311:G:T\tG\t20\t101498\t20:101498:A:G\tA\t-0.301675"
-    )
-    assert format_row(**BASE, with_r=True, allele_label="MAJ") == expected
-    assert format_row(**BASE, with_r=True, allele_label="REF") == expected
+@pytest.mark.parametrize(
+    "with_r, label, header",
+    [
+        (False, "MAJ", HEADER_R2),
+        (False, "REF", HEADER_R2),
+        (True, "MAJ", HEADER_R_MAJOR),
+        (True, "REF", HEADER_R_REF),
+    ],
+)
+def test_header_for_selects_the_column_set(with_r, label, header):
+    assert header_for(with_r=with_r, allele_label=label) == header
 
 
-def test_header_for_selects_the_column_set():
-    assert header_for(with_r=False) == HEADER_R2
-    assert header_for(with_r=True, allele_label="MAJ") == HEADER_R_MAJOR
-    assert header_for(with_r=True, allele_label="REF") == HEADER_R_REF
-    with pytest.raises(ValueError):
+def test_header_for_rejects_unknown_label():
+    with pytest.raises(ValueError, match="unknown allele label"):
         header_for(with_r=True, allele_label="NOPE")
 
 
-def test_headers_have_the_expected_column_counts():
+def test_headers_have_the_expected_columns():
     assert HEADER_R2.split("\t") == [
         "#CHROM_A", "POS_A", "ID_A", "CHROM_B", "POS_B", "ID_B", "UNPHASED_R2",
     ]
@@ -73,29 +83,21 @@ def test_headers_have_the_expected_column_counts():
         ]
 
 
-def test_write_header_selects_column_set(tmp_path):
+def test_write_header_selects_the_column_set(tmp_path):
     path = tmp_path / "out.vcor"
     with open(path, "w", encoding="utf-8") as handle:
         write_header(handle, with_r=False)
         write_header(handle, with_r=True, allele_label="MAJ")
         write_header(handle, with_r=True, allele_label="REF")
-    lines = path.read_text(encoding="utf-8").splitlines()
-    assert lines == [HEADER_R2, HEADER_R_MAJOR, HEADER_R_REF]
+    assert path.read_text(encoding="utf-8").splitlines() == [
+        HEADER_R2,
+        HEADER_R_MAJOR,
+        HEADER_R_REF,
+    ]
 
 
 def test_write_row_emits_a_trailing_newline(tmp_path):
     path = tmp_path / "out.vcor"
     with open(path, "w", encoding="utf-8") as handle:
-        write_row(handle, **BASE, with_r=True, allele_label="MAJ")
-    assert path.read_text(encoding="utf-8") == (
-        "20\t114311\t20:114311:G:T\tG\t20\t101498\t20:101498:A:G\tA\t-0.301675\n"
-    )
-
-
-def test_python_m_entry_point_runs():
-    """``python -m crossld`` must delegate to :func:`crossld.crossld.main`."""
-
-    with pytest.raises(SystemExit) as excinfo:
-        runpy.run_module("crossld", run_name="__main__", alter_sys=True)
-    # ``crossld --version``-free invocation exits through argparse's error path.
-    assert excinfo.value.code != 0
+        write_row(handle, **BASE, with_r=True)
+    assert path.read_text(encoding="utf-8") == R_ROW + "\n"

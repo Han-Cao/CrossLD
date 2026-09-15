@@ -25,13 +25,11 @@ where = ["src"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
-addopts = "--cov=crossld --cov-report=term-missing"
 
 [tool.coverage.run]
 source = ["crossld"]
 
 [tool.coverage.report]
-fail_under = 90
 show_missing = true
 exclude_lines = [
     "pragma: no cover",

@@ -12,6 +12,10 @@ DATA_DIR = TESTS_DIR / "data"
 FIXTURE_DIR = DATA_DIR
 
 
+# --------------------------------------------------------------------------- #
+# session fixtures
+# --------------------------------------------------------------------------- #
+
 @pytest.fixture(scope="session")
 def tests_dir() -> Path:
     return TESTS_DIR
@@ -57,6 +61,29 @@ def truth_r_ref_path() -> Path:
     return DATA_DIR / "ld_results_r_ref.vcor"
 
 
+@pytest.fixture(scope="session")
+def loaded_pair(sample1_prefix, sample2_prefix):
+    """The curated real datasets, loaded with their shared sample subset.
+
+    Session-scoped because opening a ``.pgen`` is the expensive part of the
+    suite; tests must not mutate the datasets (apply their own filters on
+    copies or synthetic data).
+    """
+
+    from crossld.plinkio import load_two_datasets
+
+    ds1, ds2 = load_two_datasets(
+        sample1_prefix, "pfile", False, sample2_prefix, "pfile", False
+    )
+    yield ds1, ds2
+    ds1.close()
+    ds2.close()
+
+
+# --------------------------------------------------------------------------- #
+# metadata / list writers
+# --------------------------------------------------------------------------- #
+
 def write_fam(path: Path, sample_ids: list[str]) -> None:
     with open(path, "w", encoding="utf-8") as handle:
         for iid in sample_ids:
@@ -72,6 +99,24 @@ def write_bim(path: Path, variants: list[tuple[str, str, int, str, str]]) -> Non
     with open(path, "w", encoding="utf-8") as handle:
         for chrom, vid, pos, ref, alt in variants:
             handle.write(f"{chrom}\t{vid}\t0\t{pos}\t{alt}\t{ref}\n")
+
+
+def write_psam(path: Path, sample_ids: list[str]) -> None:
+    """Write a minimal ``.psam`` with an ``#IID`` header."""
+
+    with open(path, "w", encoding="utf-8") as handle:
+        handle.write("#IID\tSEX\n")
+        for iid in sample_ids:
+            handle.write(f"{iid}\tNA\n")
+
+
+def write_pvar(path: Path, variants: list[tuple[str, str, int, str, str]]) -> None:
+    """Write a minimal ``.pvar`` (``variants`` are ``(chrom, id, pos, ref, alt)``)."""
+
+    with open(path, "w", encoding="utf-8") as handle:
+        handle.write("#CHROM\tPOS\tID\tREF\tALT\n")
+        for chrom, vid, pos, ref, alt in variants:
+            handle.write(f"{chrom}\t{pos}\t{vid}\t{ref}\t{alt}\n")
 
 
 def write_bed(path: Path, genotypes: np.ndarray, sample_ids: list[str]) -> None:
@@ -105,6 +150,10 @@ def write_bed_intervals(path: Path, intervals: list[tuple[str, int, int]]) -> No
     )
 
 
+# --------------------------------------------------------------------------- #
+# synthetic dataset builders
+# --------------------------------------------------------------------------- #
+
 def make_bfile(
     tmp_path: Path,
     name: str,
@@ -128,13 +177,13 @@ def make_pfile(
     sample_ids: list[str],
     variants: list[tuple[str, str, int, str, str]],
 ):
-    """Create a synthetic ``.pgen/.bim/.fam`` dataset (pgen + bim metadata)."""
+    """Create a synthetic ``.pgen/.pvar/.psam`` dataset and return its prefix."""
 
     import pgenlib
 
     prefix = tmp_path / name
-    write_fam(Path(f"{prefix}.fam"), sample_ids)
-    write_bim(Path(f"{prefix}.bim"), variants)
+    write_psam(Path(f"{prefix}.psam"), sample_ids)
+    write_pvar(Path(f"{prefix}.pvar"), variants)
     writer = pgenlib.PgenWriter(
         f"{prefix}.pgen".encode(),
         len(sample_ids),
@@ -153,13 +202,13 @@ def make_dosage_pfile(
     sample_ids: list[str],
     variants: list[tuple[str, str, int, str, str]],
 ):
-    """Create a synthetic dosage ``.pgen/.bim/.fam`` dataset."""
+    """Create a synthetic dosage ``.pgen/.pvar/.psam`` dataset."""
 
     import pgenlib
 
     prefix = tmp_path / name
-    write_fam(Path(f"{prefix}.fam"), sample_ids)
-    write_bim(Path(f"{prefix}.bim"), variants)
+    write_psam(Path(f"{prefix}.psam"), sample_ids)
+    write_pvar(Path(f"{prefix}.pvar"), variants)
     writer = pgenlib.PgenWriter(
         f"{prefix}.pgen".encode(),
         len(sample_ids),
@@ -172,6 +221,30 @@ def make_dosage_pfile(
     return str(prefix)
 
 
+# --------------------------------------------------------------------------- #
+# independent math oracle
+# --------------------------------------------------------------------------- #
+
+def pearson_reference(target: np.ndarray, row: np.ndarray) -> float:
+    """Pairwise-valid Pearson r via :func:`numpy.corrcoef` (independent oracle).
+
+    Missing calls are negative values on either side. Returns ``NaN`` when
+    fewer than three samples are usable or either side has zero variance, the
+    same contract as :func:`crossld.ld.pearson_pairwise`.
+    """
+
+    target = np.asarray(target, dtype=float)
+    row = np.asarray(row, dtype=float)
+    valid = (target >= 0) & (row >= 0)
+    if int(valid.sum()) < 3:
+        return float("nan")
+    x = target[valid]
+    y = row[valid]
+    if float(x.std()) == 0.0 or float(y.std()) == 0.0:
+        return float("nan")
+    return float(np.corrcoef(x, y)[0, 1])
+
+
 __all__ = [
     "DATA_DIR",
     "FIXTURE_DIR",
@@ -179,9 +252,12 @@ __all__ = [
     "make_bfile",
     "make_dosage_pfile",
     "make_pfile",
+    "pearson_reference",
     "write_bed",
     "write_bed_intervals",
     "write_bim",
     "write_extract",
     "write_fam",
+    "write_psam",
+    "write_pvar",
 ]
