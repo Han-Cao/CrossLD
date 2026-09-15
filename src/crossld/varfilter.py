@@ -71,17 +71,23 @@ class VariantFilter:
             return np.ones(ds.variant_ct, dtype=bool)
 
         if self.extract:
-            ids = read_vid_file(self.extract)
-            self._warn_unmatched("--extract", self.extract, ids, ds)
-            idx_extract = _matching_indices(ds, ids)
+            idx_extract, matched, requested = _match_variant_indices(
+                ds, read_vid_file(self.extract)
+            )
+            self._warn_unmatched(
+                "--extract", self.extract, requested - matched, requested
+            )
             mask[idx_extract] = True
         if self.extract_bed:
             mask |= _in_intervals(ds, read_bed_file(self.extract_bed))
 
         if self.exclude:
-            ids = read_vid_file(self.exclude)
-            self._warn_unmatched("--exclude", self.exclude, ids, ds)
-            idx_exclude = _matching_indices(ds, ids)
+            idx_exclude, matched, requested = _match_variant_indices(
+                ds, read_vid_file(self.exclude)
+            )
+            self._warn_unmatched(
+                "--exclude", self.exclude, requested - matched, requested
+            )
             mask[idx_exclude] = False
         if self.exclude_bed:
             mask &= ~_in_intervals(ds, read_bed_file(self.exclude_bed))
@@ -113,31 +119,40 @@ class VariantFilter:
 
     @staticmethod
     def _warn_unmatched(
-        option: str, path: str, ids: list[str], ds: PlinkDataset
+        option: str, path: str, unmatched: int, requested: int
     ) -> None:
-        known = set(ids)
-        matched = sum(1 for vid in known if ds.index_of(vid) is not None)
-        unmatched = len(known) - matched
         if unmatched:
             logger.warning(
                 "%s %s: %d of %d variant ID(s) matched no dataset-2 variant",
                 option,
                 path,
                 unmatched,
-                len(known),
+                requested,
             )
 
 
-def _matching_indices(ds: PlinkDataset, ids: list[str]) -> npt.NDArray[np.int64]:
-    """Dataset-2 indexes for the listed IDs that exist (deduplicated)."""
+def _match_variant_indices(
+    ds: PlinkDataset, ids: list[str]
+) -> tuple[npt.NDArray[np.uint32], int, int]:
+    """Resolve a variant-ID list against ``ds``.
+
+    Returns ``(indices, matched, requested)``: the ascending dataset indexes of
+    the requested IDs that exist (deduplicated), plus the matched/requested
+    counts used for the unmatched warning.
+    """
 
     ds.build_vid_index()
-    found: set[int] = set()
-    for vid in set(ids):
+    requested_ids = set(ids)
+    indices: list[int] = []
+    matched = 0
+    for vid in requested_ids:
         index = ds.index_of(vid)
-        if index is not None:
-            found.add(index)
-    return np.asarray(sorted(found), dtype=np.int64)
+        if index is None:
+            continue
+        matched += 1
+        indices.append(index)
+    indices.sort()
+    return np.asarray(indices, dtype=np.uint32), matched, len(requested_ids)
 
 
 def read_vid_file(path: str) -> list[str]:
@@ -189,11 +204,7 @@ def read_bed_file(path: str) -> list[tuple[str, int, int]]:
 
 
 def _normalize_chrom(chrom: str) -> str:
-    """Strip a leading ``chr`` (case-insensitive) from a BED chromosome name.
-
-    PLINK chromosomes are stored as plain numbers (e.g. ``20``), so only BED
-    input needs this adjustment.
-    """
+    """Strip a leading ``chr`` (case-insensitive) from a BED chromosome name."""
 
     if chrom[:3].lower() == "chr":
         return chrom[3:]
@@ -205,7 +216,7 @@ def _in_intervals(
 ) -> npt.NDArray[np.bool_]:
     mask = np.zeros(ds.variant_ct, dtype=bool)
     for chrom, start, end in intervals:
-        entry = ds.get_sorted_index(chrom)
+        entry = ds.get_sorted_index(chrom, filtered=False)
         if entry is None:
             continue
 
