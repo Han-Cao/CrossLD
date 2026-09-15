@@ -130,38 +130,33 @@ def pearson_pairwise_sparse(
         idx = sample_idxs[k]
         v = values[k]
 
+        # idx.size == 0 -> var_x == 0, skip
         if idx.size == 0:
-            n = t0
-            sum_x = 0.0
-            sum_x2 = 0.0
-            sum_xt = 0.0
-            sum_t = t1
-            sum_t2 = t2
-        else:
-            t_listed = target[idx]
-            t_listed_valid = t_listed >= 0
-            vt_valid = (v >= 0) & t_listed_valid
+            n_out[k] = t0
+            continue
 
-            # t0 already handles invalid target
-            # so check missing in v & t_listed_valid v missing only
-            v_missing = int(((v < 0) & t_listed_valid).sum())
-            n = t0 - v_missing
+        t_listed = target[idx]
+        t_listed_valid = t_listed >= 0
+        vt_valid = (v >= 0) & t_listed_valid
 
-            if n < 3:
-                n_out[k] = n
-                continue
-
-            t_drop_by_v = (~vt_valid) & t_listed_valid
-            sum_t = t1 - float(t_listed[t_drop_by_v].sum())
-            sum_t2 = t2 - float((t_listed[t_drop_by_v] ** 2).sum())
-
-            good_v = v[vt_valid]
-            good_t = t_listed[vt_valid]
-            sum_x = float(good_v.sum())
-            sum_x2 = float((good_v * good_v).sum())
-            sum_xt = float((good_v * good_t).sum())
-
+        # t0 already handles invalid target
+        # so check missing in v & t_listed_valid v missing only
+        v_missing = int(((v < 0) & t_listed_valid).sum())
+        n = t0 - v_missing
         n_out[k] = n
+
+        if n < 3:
+            continue
+
+        t_drop_by_v = (~vt_valid) & t_listed_valid
+        sum_t = t1 - float(t_listed[t_drop_by_v].sum())
+        sum_t2 = t2 - float((t_listed[t_drop_by_v] ** 2).sum())
+
+        good_v = v[vt_valid]
+        good_t = t_listed[vt_valid]
+        sum_x = float(good_v.sum())
+        sum_x2 = float((good_v * good_v).sum())
+        sum_xt = float((good_v * good_t).sum())
 
         numerator = n * sum_xt - sum_x * sum_t
         var_x = n * sum_x2 - sum_x * sum_x
@@ -169,6 +164,8 @@ def pearson_pairwise_sparse(
         if var_x <= 0 or var_t <= 0:
             continue
         denom = np.sqrt(var_x * var_t)
+        # this only helps with var_x * var_t underflows to 0.0
+        # to avoid dividing by 0.0, we do one more check
         if denom <= 0:
             continue
         r = numerator / denom
