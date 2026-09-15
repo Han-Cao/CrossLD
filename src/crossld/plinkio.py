@@ -9,8 +9,7 @@ from __future__ import annotations
 import logging
 import os
 from collections import defaultdict
-from collections.abc import KeysView
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 
 import numpy as np
 import numpy.typing as npt
@@ -38,6 +37,10 @@ class PlinkDataset:
     dataset-2 active-subset order::
 
         samples1[sample_subset1][idx_bridge] == samples2[sample_subset2]
+
+    REF/ALT alleles are not cached: :meth:`ref_allele` / :meth:`alt_allele` read
+    them from the underlying ``.pvar``/``.bim`` reader on demand, so only the rows
+    that are actually written pay for them.
     """
 
     # required
@@ -53,13 +56,12 @@ class PlinkDataset:
     _reader: pgenlib.PgenReader
     _pvar: pgenlib.PvarReader
     # optional
-    ref: list[str] = field(default_factory=list)
-    alt: list[str] = field(default_factory=list)
     sample_subset: npt.NDArray[np.uint32] | None = None
     idx_bridge: npt.NDArray[np.uint32] | None = None
     dosage: bool = False
     _vid_index: dict[str, int] | None = None
     _group_sort: dict[str, tuple[npt.NDArray[np.uint32], npt.NDArray[np.uint32]]] | None = None
+    _variant_mask: npt.NDArray[np.bool_] | None = None
 
     @property
     def variant_ct(self) -> int:
@@ -94,12 +96,35 @@ class PlinkDataset:
             self.build_vid_index()
         return self._vid_index.get(variant_id)
 
-    @property
-    def unique_ids(self) -> KeysView[str]:
-        if self._vid_index is None:
-            logger.debug("Unexpected behavior: query unique variant ID before building _vid_index")
-            self.build_vid_index()
-        return self._vid_index.keys()
+    def ref_allele(self, index: int) -> str:
+        """Decoded REF allele for a variant, read on demand from the pvar/bim reader."""
+
+        return self._pvar.get_allele_code(index, 0).decode()
+
+    def alt_allele(self, index: int) -> str:
+        """Decoded ALT allele for a variant, read on demand from the pvar/bim reader."""
+
+        return self._pvar.get_allele_code(index, 1).decode()
+
+    def apply_variant_filter(self, mask: npt.NDArray[np.bool_]) -> None:
+        """Restrict position/interval queries to the kept variants.
+
+        ``mask`` is a boolean array over **all** variants in file order. It is
+        applied once and reused by every :meth:`get_sorted_index` query, so
+        downstream code (window selection) sees only kept variants.
+        """
+
+        mask = np.asarray(mask, dtype=bool)
+        if mask.shape != (self.variant_ct,):
+            raise PlinkIOError(
+                f"variant filter has shape {mask.shape}, expected ({self.variant_ct},)"
+            )
+        self._variant_mask = mask
+        logger.debug(
+            "dataset: variant filter kept %d of %d variants",
+            int(mask.sum()),
+            self.variant_ct,
+        )
 
     def sort_pos_by_chrom(self) -> None:
         """Build a mapping: chrom -> (positions sorted, variant indices for those positions)."""
@@ -120,14 +145,28 @@ class PlinkDataset:
         self._group_sort = group_sort
 
     def get_sorted_index(
-        self, chrom: str
+        self, chrom: str, filtered: bool = True
     ) -> tuple[npt.NDArray[np.uint32], npt.NDArray[np.uint32]] | None:
-        """Position-sorted ``(pos, variant_idx)`` for ``chrom``. Apply variant filter if exists."""
+        """Position-sorted ``(pos, variant_idx)`` for ``chrom``.
+
+        When a variant filter has been applied (see
+        :meth:`apply_variant_filter`) and ``filtered`` is true, only kept
+        variants are returned. Pass ``filtered=False`` to query the full file
+        (used while building the filter itself).
+        """
 
         if self._group_sort is None:
             logger.debug("Unexpected behavior: query sorted index before building _group_sort")
             self.sort_pos_by_chrom()
-        return self._group_sort.get(chrom)
+        entry = self._group_sort.get(chrom)
+        if entry is None:
+            return None
+        pos, idx = entry
+        if filtered and self._variant_mask is not None:
+            keep = self._variant_mask[idx]
+            if not keep.all():
+                return pos[keep], idx[keep]
+        return pos, idx
 
     def close(self) -> None:
         reader = getattr(self, "_reader", None)
@@ -311,7 +350,7 @@ def _resolve_files(prefix: str, fmt: str) -> tuple[str, str, str]:
 def load_two_datasets(
     prefix1: str, fmt1: str, dosage1: bool,
     prefix2: str, fmt2: str, dosage2: bool,
-    keep: str | None = None
+    keep_sample_file: str | None = None,
 ) -> tuple[PlinkDataset, PlinkDataset]:
     """Load dataset 1 and dataset 2, map analysis samples in dataset 1 to dataset 2."""
 
@@ -320,10 +359,10 @@ def load_two_datasets(
     sample_path2 = _resolve_files(prefix2, fmt2)[2]
     samples1 = parse_sample(sample_path1, fmt1)
     samples2 = parse_sample(sample_path2, fmt2)
-    if keep is None:
+    if keep_sample_file is None:
         samples_ld = select_samples(samples1, samples2)
     else:
-        samples_ld = select_samples(samples1, samples2, read_keep_file(keep))
+        samples_ld = select_samples(samples1, samples2, read_keep_file(keep_sample_file))
 
     # find subset idx; np.flatnonzero keeps them increasing, which pgenlib requires
     sample_subset1 = np.flatnonzero(np.isin(samples1, samples_ld)).astype(np.uint32)
@@ -340,14 +379,18 @@ def load_two_datasets(
     # load dataset 1
     # dataset 1 always query by id, build index here
     logger.info("loading dataset 1: %s", prefix1)
-    ds1 = load_dataset(prefix1, fmt1, samples1, dosage1, sample_subset1, idx_bridge)
+    ds1 = load_dataset(
+        prefix1, fmt1, samples1, dosage1, sample_subset1, idx_bridge,
+    )
     ds1.build_vid_index()
 
     # load dataset 2
     # dataset 2 always query by position, sort it here
     # varfilter will also query by id, so build vid index later when needed
     logger.info("loading dataset 2: %s", prefix2)
-    ds2 = load_dataset(prefix2, fmt2, samples2, dosage2, sample_subset2)
+    ds2 = load_dataset(
+        prefix2, fmt2, samples2, dosage2, sample_subset2,
+    )
     ds2.sort_pos_by_chrom()
 
     return ds1, ds2
@@ -364,7 +407,9 @@ def load_dataset(
     """Open a dataset and read its variant metadata.
 
     When ``sample_subset`` is given the reader is created with that subset so that
-    downstream reads honor it; otherwise the reader spans all samples.
+    downstream reads honor it; otherwise the reader spans all samples. REF/ALT
+    alleles are not read here; use :meth:`PlinkDataset.ref_allele` /
+    :meth:`PlinkDataset.alt_allele` when they are needed.
     """
 
     genotype_path, variant_path, sample_path = _resolve_files(prefix, fmt)
@@ -381,15 +426,10 @@ def load_dataset(
     chrom: list[str] = []
     pos: list[int] = []
     ids: list[str] = []
-    ref: list[str] = []
-    alt: list[str] = []
     for i in range(variant_ct):
-        # TODO: keep using bytes for ref and alt here? only decode when need to print
         chrom.append(pvar.get_variant_chrom(i).decode())
         pos.append(pvar.get_variant_pos(i))
         ids.append(pvar.get_variant_id(i).decode())
-        ref.append(pvar.get_allele_code(i, 0).decode())
-        alt.append(pvar.get_allele_code(i, 1).decode())
     pos_array = np.array(pos, dtype=np.uint32)
 
     is_bed = genotype_path.endswith(".bed")
@@ -416,8 +456,6 @@ def load_dataset(
         chrom=chrom,
         pos=pos_array,
         ids=ids,
-        ref=ref,
-        alt=alt,
         sample_subset=sample_subset,
         idx_bridge=idx_bridge,
         dosage=dosage,
@@ -504,14 +542,14 @@ def candidate_indices(
     target_index: int,
     window_kb: float,
     window_count: int,
-    kept_indices: npt.NDArray[np.uint32] | None = None,
 ) -> npt.NDArray[np.uint32]:
     """Dataset-2 variant indexes within the target's window.
 
     ``window_count`` is the maximum number of dataset-2 variants kept, chosen as
     the nearest by absolute position distance (``0`` means no limit). Only
-    ``kept_indices`` (the post-filter variants) are eligible. The returned
-    indexes are unique and ascending, which is what ``pgenlib`` prefers.
+    variants surviving the dataset's variant filter are eligible (see
+    :meth:`PlinkDataset.apply_variant_filter`). The returned indexes are unique
+    and ascending, which is what ``pgenlib`` prefers.
     """
 
     chrom = ds1.chrom[target_index]
@@ -520,16 +558,7 @@ def candidate_indices(
     entry = ds2.get_sorted_index(chrom)
     if entry is None:
         return np.empty(0, dtype=np.uint32)
-    pos_sorted, idx_sorted = entry
-
-    if kept_indices is None:
-        keep = np.ones(idx_sorted.size, dtype=bool)
-    else:
-        kept_mask = np.zeros(ds2.variant_ct, dtype=bool)
-        kept_mask[kept_indices] = True
-        keep = kept_mask[idx_sorted]
-    pos_k = pos_sorted[keep]
-    idx_k = idx_sorted[keep]
+    pos_k, idx_k = entry
 
     if window_kb >= 0 and pos_k.size:
         span = window_kb * 1000
@@ -539,7 +568,7 @@ def candidate_indices(
         idx_k = idx_k[lo:hi]
 
     if window_count > 0 and idx_k.size > window_count:
-        distance = np.abs(pos_k.astype(np.int64) - pos_a)
+        distance = np.abs(pos_k - pos_a)
         order = np.argsort(distance, kind="stable")[:window_count]
         idx_k = idx_k[order]
 
