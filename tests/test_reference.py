@@ -9,6 +9,10 @@ targets (``tests/data/ld_snp_list.txt``) with ``--extract`` and
                                  allele per side (``MAJ_A``/``MAJ_B``)
 * ``ld_results_r_ref.vcor``   -- ``--r --ref-based``: same, with
                                  ``REF_A``/``REF_B``
+
+Each file has 788 rows: the 784 target x other-variant pairs plus the four
+self-pairs (a target that is also present in dataset 2, correlated against
+itself with ``r``/``r²`` of ``1``).
 """
 
 from __future__ import annotations
@@ -24,7 +28,12 @@ import pytest
 from crossld.blocks import BlockReader
 from crossld.crossld import main as cli_main
 from crossld.ld import major_allele_flipped, pearson_pairwise
-from crossld.plinkio import load_dataset, resolve_targets, select_samples
+from crossld.plinkio import (
+    load_dataset,
+    load_two_datasets,
+    parse_sample,
+    resolve_targets,
+)
 from crossld.varfilter import VariantFilter
 
 SRC = Path(__file__).resolve().parent.parent / "src"
@@ -35,7 +44,7 @@ ACCEPTANCE_ARGS = ["--ld-window-r2", "0.05"]
 VALUE_TOLERANCE = 6e-7
 
 # Every reference file has this many rows, all of them reproducible.
-TRUTH_ROWS = 784
+TRUTH_ROWS = 788
 
 
 # --------------------------------------------------------------------------- #
@@ -87,19 +96,21 @@ class _RawVectors:
     """Raw ALT-allele dosage vectors, so tests can orient them explicitly."""
 
     def __init__(self, ds1, ds2):
-        subset1, subset2, _ = select_samples(ds1, ds2)
-        ds1.set_sample_subset(subset1)
-        ds2.set_sample_subset(subset2)
         self.ds1, self.ds2 = ds1, ds2
         data = _data_dir()
         self.targets = resolve_targets(ds1, snp_list=str(data / "ld_snp_list.txt"))
         self.kept = np.flatnonzero(
             VariantFilter(extract=str(data / "ld_extract_snp_list.txt")).build_mask(ds2)
         )
-        self._reader1 = BlockReader(ds1, sparse="never")
-        self._reader2 = BlockReader(ds2, sparse="never")
-        self.a = {ti: self._reader1.read([ti])[0][0].copy() for ti in self.targets}
-        self.b = {int(bi): self._reader2.read([bi])[0][0].copy() for bi in self.kept}
+        self._reader1 = BlockReader(ds1, force_dense=True)
+        self._reader2 = BlockReader(ds2, force_dense=True)
+        # Dataset-1 vectors are permuted into dataset-2 sample order so both sides
+        # are aligned for pearson_pairwise.
+        bridge = ds1.idx_bridge
+        self.a = {
+            ti: self._reader1.read([ti]).dense[0][bridge].copy() for ti in self.targets
+        }
+        self.b = {int(bi): self._reader2.read([bi]).dense[0].copy() for bi in self.kept}
 
     def code(self, vec: np.ndarray, mode: str) -> np.ndarray:
         if mode == "alt":
@@ -117,18 +128,27 @@ class _RawVectors:
         return float(r[0])
 
     def ref(self, ti: int, bi: int) -> tuple[str, str]:
-        return self.ds1.ref[ti], self.ds2.ref[bi]
+        return self.ds1.ref_allele(ti), self.ds2.ref_allele(bi)
 
     def major(self, ti: int, bi: int) -> tuple[str, str]:
-        maj_a = self.ds1.ref[ti] if major_allele_flipped(self.a[ti]) else self.ds1.alt[ti]
-        maj_b = self.ds2.ref[bi] if major_allele_flipped(self.b[bi]) else self.ds2.alt[bi]
+        maj_a = (
+            self.ds1.alt_allele(ti)
+            if major_allele_flipped(self.a[ti])
+            else self.ds1.ref_allele(ti)
+        )
+        maj_b = (
+            self.ds2.alt_allele(bi)
+            if major_allele_flipped(self.b[bi])
+            else self.ds2.ref_allele(bi)
+        )
         return maj_a, maj_b
 
 
 @pytest.fixture(scope="module")
 def raw_vectors(sample1_prefix, sample2_prefix):
-    ds1 = load_dataset(sample1_prefix, "dataset1", "pfile")
-    ds2 = load_dataset(sample2_prefix, "dataset2", "pfile")
+    ds1, ds2 = load_two_datasets(
+        sample1_prefix, "pfile", False, sample2_prefix, "pfile", False
+    )
     yield _RawVectors(ds1, ds2)
     ds1.close()
     ds2.close()
@@ -136,7 +156,8 @@ def raw_vectors(sample1_prefix, sample2_prefix):
 
 @pytest.fixture(scope="module")
 def current_b_ids(sample2_prefix):
-    ds2 = load_dataset(sample2_prefix, "dataset2", "pfile")
+    sample_ids = parse_sample(f"{sample2_prefix}.psam", "pfile")
+    ds2 = load_dataset(sample2_prefix, "pfile", sample_ids)
     try:
         return set(ds2.ids)
     finally:
