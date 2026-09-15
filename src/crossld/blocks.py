@@ -58,7 +58,10 @@ class BlockMatrix:
 
 @dataclass
 class BlockReader:
-    """Reads variant blocks as int8 hardcalls or float32 dosages on the active subset."""
+    """Reads variant blocks as int8 hardcalls or float32 dosages on the active subset.
+
+    For sparse variants, the reader always read the alt alelle (pgenlib's default).
+    """
 
     dataset: PlinkDataset
     dosage: bool = False
@@ -90,10 +93,9 @@ class BlockReader:
             return self._empty(stats)
 
         if self.force_dense or self.fmt == "bfile":
-            idx_dense = idx_array
             idx_sparse = np.empty(0, dtype=np.uint32)
         else:
-            idx_dense, idx_sparse = self._find_dense_sparse(idx_array)
+            idx_sparse = self._find_sparse(idx_array)
 
         if idx_sparse.size:
             sparse_mask = np.isin(idx_array, idx_sparse)
@@ -125,6 +127,8 @@ class BlockReader:
         )
 
     def _empty(self, stats: BlockStats) -> BlockMatrix:
+        """Return an empty BlockMatrix."""
+
         return BlockMatrix(
             dense=np.empty((0, self.sample_ct), dtype=self.arr_dtype),
             dense_rows=np.empty(0, dtype=np.uint32),
@@ -160,26 +164,16 @@ class BlockReader:
             lst_values.append(values)
         return lst_sample_idxs, lst_values
 
-    def _find_dense_sparse(
+    def _find_sparse(
         self, idx_array: npt.NDArray[np.uint32]
-    ) -> tuple[npt.NDArray[np.uint32], npt.NDArray[np.uint32]]:
-        """Split variant indexes into dense and sparse groups."""
+    ) -> npt.NDArray[np.uint32]:
+        """Find indeces of sparse variants."""
 
-        if self.fmt == "bfile":
-            return idx_array, np.empty(0, dtype=np.uint32)
-
-        idx_dense: list[int] = []
         idx_sparse: list[int] = []
         for idx in idx_array.tolist():
             if self._has_sparse(idx):
                 idx_sparse.append(idx)
-            else:
-                idx_dense.append(idx)
-
-        return (
-            np.asarray(idx_dense, dtype=np.uint32),
-            np.asarray(idx_sparse, dtype=np.uint32),
-        )
+        return  np.asarray(idx_sparse, dtype=np.uint32)
 
     def _has_sparse(self, variant_idx: int) -> bool:
         """Check if a variant has a sparse representation for dosage or hardcalls."""
