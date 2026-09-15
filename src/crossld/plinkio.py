@@ -514,7 +514,7 @@ def resolve_targets(
 
     ids: list[str] = []
     indices: list[int] = []
-    seen: set[int] = set()
+    seen: set[str] = set()
     if single is not None:
         ids.append(single)
     if snps is not None:
@@ -524,13 +524,13 @@ def resolve_targets(
 
     n_miss = 0
     for vid in ids:
+        if vid not in seen:
+            seen.add(vid)
         index = ds.index_of(vid)
         if index is None:
             n_miss += 1
             continue
-        if index not in seen:
-            seen.add(index)
-            indices.append(index)
+        indices.append(index)
     if n_miss > 0:
         logger.warning("%d target LD variants not found in dataset 1", n_miss)
     return indices
