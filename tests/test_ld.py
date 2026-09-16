@@ -19,10 +19,11 @@ from crossld.ld import (
     major_allele_flipped_sparse,
     pearson_pairwise,
     pearson_pairwise_block,
+    pearson_pairwise_complete,
     pearson_pairwise_sparse,
+    pearson_pairwise_sparse_complete,
 )
 from tests.conftest import pearson_reference
-
 
 # --------------------------------------------------------------------------- #
 # helpers
@@ -343,3 +344,146 @@ def test_block_empty_read():
     )
     r, n = pearson_pairwise_block(TARGET, empty)
     assert r.shape == n.shape == (0,)
+
+
+# --------------------------------------------------------------------------- #
+# complete (no-missing) fast paths
+# --------------------------------------------------------------------------- #
+
+@pytest.mark.parametrize("dtype", [np.int8, np.float32, np.float64])
+def test_dense_complete_matches_masked(dtype):
+    rng = np.random.default_rng(21)
+    target = rng.integers(0, 3, size=250).astype(dtype)
+    block = rng.integers(0, 3, size=(9, 250)).astype(dtype)
+    r_masked, n_masked = pearson_pairwise(target, block)
+    r_fast, n_fast = pearson_pairwise_complete(target, block)
+    assert np.array_equal(n_masked, n_fast)
+    assert np.allclose(r_masked, r_fast, atol=1e-12, equal_nan=True)
+
+
+def test_dense_complete_matches_oracle_and_nan_rules():
+    rng = np.random.default_rng(22)
+    target = rng.integers(0, 3, size=200).astype(float)
+    block = rng.integers(0, 3, size=(6, 200)).astype(float)
+    block[4] = 1.0  # constant row -> zero variance -> NaN
+    r, n = pearson_pairwise_complete(target, block)
+    assert list(int(x) for x in n) == [200] * 6
+    for i in range(6):
+        expected = pearson_reference(target, block[i])
+        if np.isnan(expected):
+            assert np.isnan(float(r[i]))
+        else:
+            assert float(r[i]) == pytest.approx(expected, abs=1e-9)
+
+
+def test_dense_complete_zero_variance_target_is_nan():
+    block = np.array([[0.0, 1.0, 2.0], [2.0, 1.0, 0.0]])
+    r, n = pearson_pairwise_complete(np.zeros(3), block)
+    assert np.isnan(r).all()
+    assert list(int(x) for x in n) == [3, 3]
+
+
+def test_dense_complete_empty_block():
+    r, n = pearson_pairwise_complete(TARGET, np.empty((0, TARGET.size)))
+    assert r.shape == n.shape == (0,)
+
+
+def test_sparse_complete_matches_masked_and_oracle():
+    rng = np.random.default_rng(23)
+    target = rng.integers(0, 3, size=180).astype(float)
+    block = rng.integers(0, 3, size=(11, 180)).astype(float)
+    idxs, values = zip(*[_sparsify(row) for row in block])
+    r_masked, n_masked = pearson_pairwise_sparse(target, list(idxs), list(values))
+    r_fast, n_fast = pearson_pairwise_sparse_complete(
+        target, list(idxs), list(values), sample_ct=180
+    )
+    assert np.array_equal(n_masked, n_fast)
+    assert np.allclose(r_masked, r_fast, atol=1e-12, equal_nan=True)
+    for i in range(block.shape[0]):
+        expected = pearson_reference(target, block[i])
+        if np.isnan(expected):
+            assert np.isnan(float(r_fast[i]))
+        else:
+            assert float(r_fast[i]) == pytest.approx(expected, abs=1e-9)
+
+
+def test_sparse_complete_empty_and_empty_rows():
+    idxs = [np.empty(0, dtype=np.uint32), np.array([1, 2], dtype=np.uint32)]
+    values = [np.empty(0), np.array([1.0, 2.0])]
+    r, n = pearson_pairwise_sparse_complete(TARGET, idxs, values, sample_ct=6)
+    assert np.isnan(float(r[0]))  # empty row -> zero variance
+    assert int(n[0]) == 6
+    assert np.isfinite(float(r[1]))
+    assert int(n[1]) == 6
+
+
+# --------------------------------------------------------------------------- #
+# block routing + force_masked
+# --------------------------------------------------------------------------- #
+
+def _mixed_block() -> BlockMatrix:
+    """2 clean dense rows, 1 dirty dense row, 1 clean sparse, 1 dirty sparse."""
+
+    clean = np.array([0.0, 1.0, 2.0, 0.0, 1.0, 2.0])
+    dirty = clean.copy()
+    dirty[3] = -9.0
+    return _blockmatrix(
+        sample_ct=6,
+        dense_rows=[0, 1, 4],
+        dense=[clean, 2.0 - clean, dirty],
+        sparse_rows=[2, 3],
+        sparse=[
+            _sparsify(np.array([2.0, 1.0, 0.0, 2.0, 0.0, 0.0])),
+            (np.array([1, 2], dtype=np.uint32), np.array([1.0, -9.0])),
+        ],
+    )
+
+
+def test_block_routing_splits_clean_and_missing_rows():
+    fast_block = _mixed_block()
+    masked_block = _mixed_block()
+    r_fast, n_fast = pearson_pairwise_block(TARGET, fast_block)
+    r_masked, n_masked = pearson_pairwise_block(TARGET, masked_block, force_masked=True)
+
+    assert np.allclose(r_fast, r_masked, atol=1e-12, equal_nan=True)
+    assert np.array_equal(n_fast, n_masked)
+    # rows: 0 clean dense, 1 clean dense, 2 clean sparse, 3 dirty sparse, 4 dirty dense
+    assert fast_block.stats.fast_rows == 3
+    assert fast_block.stats.masked_rows == 2
+    assert list(int(x) for x in n_fast) == [6, 6, 6, 5, 5]
+    # force_masked takes the masked path for every row
+    assert masked_block.stats.fast_rows == 0
+    assert masked_block.stats.masked_rows == 5
+
+
+def test_block_all_clean_uses_the_fast_path():
+    block = _blockmatrix(
+        sample_ct=6,
+        dense_rows=[0, 1],
+        dense=[TARGET, 2.0 - TARGET],
+        sparse_rows=[2],
+        sparse=[_sparsify(np.array([2.0, 1.0, 0.0, 2.0, 0.0, 0.0]))],
+    )
+    r, _ = pearson_pairwise_block(TARGET, block)
+    assert block.stats.fast_rows == 3
+    assert block.stats.masked_rows == 0
+    assert float(r[0]) == pytest.approx(1.0)
+    assert float(r[1]) == pytest.approx(-1.0)
+    assert np.isfinite(float(r[2]))
+
+
+def test_block_no_missing_target_keeps_fast_path():
+    """A dirty row in the block must not disable the fast path for clean rows."""
+
+    block = _mixed_block()
+    pearson_pairwise_block(TARGET, block)
+    assert block.stats.fast_rows > 0
+
+
+def test_block_force_masked_disables_fast_path():
+    block = _blockmatrix(sample_ct=6, dense_rows=[0], dense=[TARGET], sparse_rows=[], sparse=[])
+    r, n = pearson_pairwise_block(TARGET, block, force_masked=True)
+    assert block.stats.fast_rows == 0
+    assert block.stats.masked_rows == 1
+    assert float(r[0]) == pytest.approx(1.0)
+    assert int(n[0]) == 6

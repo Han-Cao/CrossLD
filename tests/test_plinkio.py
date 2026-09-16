@@ -35,6 +35,15 @@ def _genotypes(n_variants: int, n_samples: int = len(SAMPLES)) -> np.ndarray:
     return rng.integers(0, 3, size=(n_variants, n_samples)).astype(np.int8)
 
 
+def _chrom_variants(chroms: list[str], positions: list[int]) -> list[tuple]:
+    """Variant tuples with distinct IDs for an arbitrary chrom/pos layout."""
+
+    return [
+        (chrom, f"{chrom}:{pos}:A:G", pos, "A", "G")
+        for chrom, pos in zip(chroms, positions)
+    ]
+
+
 @pytest.fixture()
 def synthetic_pair(tmp_path):
     """A dataset-1 with two targets and a dataset-2 with known positions."""
@@ -140,7 +149,8 @@ def test_load_dataset_reads_metadata(synthetic_pair):
     assert ds1.variant_ct == 2 and ds1.sample_ct == 6
     assert ds1.active_sample_ct == 6
     assert ds1.ids == ["1:1000:A:G", "2:1000:C:T"]
-    assert ds1.chrom == ["1", "2"]
+    assert ds1.chrom.names == ["1", "2"]
+    assert [ds1.chrom[i] for i in range(ds1.variant_ct)] == ["1", "2"]
     assert list(ds1.pos) == [1000, 1000]
     assert ds1.ref_allele(0) == "A" and ds1.alt_allele(0) == "G"
     assert ds1.index_of("2:1000:C:T") == 1
@@ -268,6 +278,93 @@ def test_sort_pos_by_chrom_is_idempotent(synthetic_pair):
     before = ds2._group_sort
     ds2.sort_pos_by_chrom()
     assert ds2._group_sort is before
+
+
+# --------------------------------------------------------------------------- #
+# chromosome index
+# --------------------------------------------------------------------------- #
+
+def test_chrom_index_contiguous_blocks(tmp_path):
+    variants = _chrom_variants(["1", "1", "2", "2", "2"], [20, 10, 5, 15, 1])
+    prefix = make_pfile(tmp_path, "contig", _genotypes(5), SAMPLES, variants)
+    ds = load_dataset(prefix, "pfile", np.array(SAMPLES))
+    try:
+        assert ds.chrom.names == ["1", "2"]
+        assert ds.chrom.n_chroms == 2
+        assert len(ds.chrom) == 5
+        assert [ds.chrom[i] for i in range(5)] == ["1", "1", "2", "2", "2"]
+        assert ds.chrom.name(4) == "2"
+        assert ds.chrom.block("1") == (0, 2)
+        assert ds.chrom.block("2") == (2, 5)
+        assert ds.chrom.block("9") is None
+        assert list(ds.chrom.indices("2")) == [2, 3, 4]
+        assert ds.chrom.indices("9") is None
+    finally:
+        ds.close()
+
+
+def test_chrom_index_interleaved_uses_codes(tmp_path):
+    variants = _chrom_variants(["1", "2", "1", "2"], [1, 2, 3, 4])
+    prefix = make_pfile(tmp_path, "inter", _genotypes(4), SAMPLES, variants)
+    ds = load_dataset(prefix, "pfile", np.array(SAMPLES))
+    try:
+        assert ds.chrom.names == ["1", "2"]
+        assert ds.chrom._codes is not None  # interleaved -> code-array fallback
+        assert ds.chrom.block("1") is None
+        assert list(ds.chrom.indices("1")) == [0, 2]
+        assert list(ds.chrom.indices("2")) == [1, 3]
+        assert [ds.chrom[i] for i in range(4)] == ["1", "2", "1", "2"]
+    finally:
+        ds.close()
+
+
+def test_sort_pos_by_chrom_sorts_unsorted_blocks(tmp_path):
+    variants = _chrom_variants(["1", "1", "1", "2"], [30, 10, 20, 5])
+    prefix = make_pfile(tmp_path, "unsorted", _genotypes(4), SAMPLES, variants)
+    ds = load_dataset(prefix, "pfile", np.array(SAMPLES))
+    try:
+        ds.sort_pos_by_chrom()
+        pos, idx = ds.get_sorted_index("1")
+        assert list(pos) == [10, 20, 30]
+        assert list(idx) == [1, 2, 0]
+        assert list(ds.get_sorted_index("2")[0]) == [5]
+    finally:
+        ds.close()
+
+
+def test_get_sorted_index_interleaved(tmp_path):
+    variants = _chrom_variants(["1", "2", "1", "2"], [30, 2, 10, 1])
+    prefix = make_pfile(tmp_path, "ixsort", _genotypes(4), SAMPLES, variants)
+    ds = load_dataset(prefix, "pfile", np.array(SAMPLES))
+    try:
+        ds.sort_pos_by_chrom()
+        pos, idx = ds.get_sorted_index("1")
+        assert list(pos) == [10, 30]
+        assert list(idx) == [2, 0]
+    finally:
+        ds.close()
+
+
+def test_candidate_indices_interleaved_are_ascending(tmp_path):
+    prefix_a = make_pfile(
+        tmp_path, "cia", _genotypes(1), SAMPLES, _chrom_variants(["1"], [20])
+    )
+    prefix_b = make_pfile(
+        tmp_path,
+        "cib",
+        _genotypes(4),
+        SAMPLES,
+        _chrom_variants(["1", "2", "1", "2"], [10, 20, 30, 40]),
+    )
+    ds1 = load_dataset(prefix_a, "pfile", np.array(SAMPLES))
+    ds2 = load_dataset(prefix_b, "pfile", np.array(SAMPLES))
+    try:
+        ds2.sort_pos_by_chrom()
+        candidates = candidate_indices(ds1, ds2, 0, 10.0, 0)
+        assert list(candidates) == [0, 2]
+    finally:
+        ds1.close()
+        ds2.close()
 
 
 # --------------------------------------------------------------------------- #

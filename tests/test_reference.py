@@ -32,6 +32,7 @@ from crossld.plinkio import (
     load_dataset,
     load_two_datasets,
     parse_sample,
+    read_ld_snp_list,
     resolve_targets,
 )
 from crossld.varfilter import VariantFilter
@@ -170,6 +171,72 @@ def _comparable(truth_rows, current_b, b_col: int = 5):
     return [row for row in truth_rows if row[b_col] in current_b]
 
 
+def _pvar_variants(path: Path) -> dict[str, tuple[str, int]]:
+    """``id -> (chrom, pos)`` for a ``.pvar``, in file order (test-local oracle)."""
+
+    variants: dict[str, tuple[str, int]] = {}
+    for line in path.read_text(encoding="utf-8").splitlines():
+        if not line or line.startswith("#"):
+            continue
+        fields = line.split("\t")
+        if len(fields) < 3:
+            continue
+        variants[fields[2]] = (fields[0], int(fields[1]))
+    return variants
+
+
+def _window_expected(
+    truth_rows,
+    variants: dict[str, tuple[str, int]],
+    extract_ids: list[str],
+    *,
+    kb: float | None = None,
+    count: int = 0,
+) -> list[str]:
+    """Truth lines that survive the same window the CLI is asked to apply.
+
+    The nearest-``count`` pool is rebuilt from the ``.pvar`` positions (not from
+    the truth rows): a nearer variant whose ``r^2`` fell below the reporting
+    threshold still occupies a count slot and pushes a truth row out. The pool
+    keeps ``.pvar`` file order and is stably sorted by distance, mirroring the
+    implementation's tie-break; ``kb`` is applied before ``count``, as in
+    :func:`crossld.plinkio.candidate_indices`.
+    """
+
+    extracted = set(extract_ids)
+    file_order = [vid for vid in variants if vid in extracted]
+    eligible: dict[tuple[str, int], set[str]] = {}
+    for row in truth_rows:
+        key = (row[0], int(row[1]))
+        if key in eligible:
+            continue
+        chrom_a, pos_a = key
+        pool = [
+            vid
+            for vid in file_order
+            if variants[vid][0] == chrom_a
+            and (kb is None or abs(variants[vid][1] - pos_a) <= kb * 1000)
+        ]
+        if count > 0:
+            pool = sorted(pool, key=lambda vid: abs(variants[vid][1] - pos_a))[:count]
+        eligible[key] = set(pool)
+
+    return [
+        "\t".join(row)
+        for row in truth_rows
+        if row[5] in eligible[(row[0], int(row[1]))]
+    ]
+
+
+def _run_windowed(sample1_prefix, sample2_prefix, out_path, extra) -> str:
+    """Run the acceptance CLI with extra window flags and return the output text."""
+
+    assert cli_main(
+        _acceptance_args(sample1_prefix, sample2_prefix, out_path, extra=extra)
+    ) == 0
+    return out_path.read_text(encoding="utf-8")
+
+
 # --------------------------------------------------------------------------- #
 # CLI output shape 1: r^2
 # --------------------------------------------------------------------------- #
@@ -260,6 +327,94 @@ def test_r_outputs_omit_the_r2_column(tmp_path, sample1_prefix, sample2_prefix):
         assert header.split("\t")[3] == f"{label}_A"
         assert header.split("\t")[7] == f"{label}_B"
         assert all(len(row) == 9 for row in rows)
+
+
+# --------------------------------------------------------------------------- #
+# windows: the truth file is a superset of any smaller window
+# --------------------------------------------------------------------------- #
+
+@pytest.mark.parametrize("kb", [0.0, 0.5, 2.0, 10.0])
+def test_ld_window_kb_matches_sliced_truth(
+    tmp_path, sample1_prefix, sample2_prefix, truth_r2_path, extract_list, kb
+):
+    """A physical window keeps exactly the truth rows within +/- kb."""
+
+    got = _run_windowed(
+        sample1_prefix,
+        sample2_prefix,
+        tmp_path / f"out_kb_{kb}.vcor",
+        ["--ld-window-kb", str(kb)],
+    )
+    header, truth = _parse(truth_r2_path)
+    variants = _pvar_variants(Path(f"{sample2_prefix}.pvar"))
+    expected = [header] + _window_expected(
+        truth, variants, read_ld_snp_list(str(extract_list)), kb=kb
+    )
+    assert got == "\n".join(expected) + "\n"
+
+
+@pytest.mark.parametrize("count", [1, 2, 5, 50, 300])
+def test_ld_window_count_matches_sliced_truth(
+    tmp_path, sample1_prefix, sample2_prefix, truth_r2_path, extract_list, count
+):
+    """A count window keeps exactly the truth rows whose B variant is nearest."""
+
+    got = _run_windowed(
+        sample1_prefix,
+        sample2_prefix,
+        tmp_path / f"out_n_{count}.vcor",
+        ["--ld-window", str(count)],
+    )
+    header, truth = _parse(truth_r2_path)
+    variants = _pvar_variants(Path(f"{sample2_prefix}.pvar"))
+    expected = [header] + _window_expected(
+        truth, variants, read_ld_snp_list(str(extract_list)), count=count
+    )
+    assert got == "\n".join(expected) + "\n"
+
+
+@pytest.mark.parametrize("kb,count", [(20.0, 10), (0.5, 2), (1.0, 5)])
+def test_ld_window_kb_and_count_combine(
+    tmp_path, sample1_prefix, sample2_prefix, truth_r2_path, extract_list, kb, count
+):
+    """The physical bound and the count bound compose (kb first, then count)."""
+
+    got = _run_windowed(
+        sample1_prefix,
+        sample2_prefix,
+        tmp_path / f"out_kb_{kb}_n_{count}.vcor",
+        ["--ld-window-kb", str(kb), "--ld-window", str(count)],
+    )
+    header, truth = _parse(truth_r2_path)
+    variants = _pvar_variants(Path(f"{sample2_prefix}.pvar"))
+    expected = [header] + _window_expected(
+        truth, variants, read_ld_snp_list(str(extract_list)), kb=kb, count=count
+    )
+    assert got == "\n".join(expected) + "\n"
+
+
+def test_ld_window_one_keeps_only_self_pairs(
+    tmp_path, sample1_prefix, sample2_prefix
+):
+    """``--ld-window 1`` keeps the target itself: the truly nearest variant."""
+
+    got = _run_windowed(
+        sample1_prefix,
+        sample2_prefix,
+        tmp_path / "out_self.vcor",
+        ["--ld-window", "1"],
+    )
+    lines = got.splitlines()
+    rows = [line.split("\t") for line in lines[1:]]
+    assert len(rows) == 4
+    assert {row[2] for row in rows} == {
+        "20:114311:G:T",
+        "20:144480:C:T",
+        "20:166845:T:C",
+        "20:199547:C:T",
+    }
+    assert all(row[2] == row[5] for row in rows)
+    assert all(float(row[6]) == 1.0 for row in rows)
 
 
 # --------------------------------------------------------------------------- #

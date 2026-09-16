@@ -225,6 +225,189 @@ def test_ld_window_kb_bounds_distance(tiny_pair, tmp_path, kb, expected):
     assert {row[5] for row in _read_rows(out_path)[1]} == expected
 
 
+# --------------------------------------------------------------------------- #
+# multi-chromosome windows: sorted contiguous vs interleaved unsorted
+# --------------------------------------------------------------------------- #
+
+MULTI_IDS = [f"S{i}" for i in range(6)]
+MULTI_TARGETS = "1:1000:A:G,2:1000:C:T"
+MULTI_VARIANTS_A = [
+    ("1", "1:1000:A:G", 1000, "A", "G"),
+    ("2", "2:1000:C:T", 1000, "C", "T"),
+]
+MULTI_GENOTYPES_A = np.array([[0, 0, 1, 1, 2, 2], [0, 1, 0, 2, 0, 2]], dtype=np.int8)
+
+# Per chromosome: proxy at the target position, near 100 bp away, distant 4 kb away.
+MULTI_VARIANTS_SORTED = [
+    ("1", "1:1000:A:G", 1000),
+    ("1", "1:1100:A:G", 1100),
+    ("1", "1:5000:A:G", 5000),
+    ("2", "2:1000:C:T", 1000),
+    ("2", "2:1100:C:T", 1100),
+    ("2", "2:5000:C:T", 5000),
+]
+# The same six variants with interleaved chromosomes and descending positions.
+MULTI_VARIANTS_INTERLEAVED = [
+    ("2", "2:5000:C:T", 5000),
+    ("1", "1:1100:A:G", 1100),
+    ("2", "2:1000:C:T", 1000),
+    ("1", "1:5000:A:G", 5000),
+    ("2", "2:1100:C:T", 1100),
+    ("1", "1:1000:A:G", 1000),
+]
+MULTI_LAYOUTS = {
+    "sorted": MULTI_VARIANTS_SORTED,
+    "interleaved": MULTI_VARIANTS_INTERLEAVED,
+}
+
+
+def _multi_build(tmp_path, name, layout, fmt):
+    """Build the two-target dataset 1 and one dataset-2 layout (bfile or pfile)."""
+
+    variants_b = [(chrom, vid, pos, "A", "G") for chrom, vid, pos in MULTI_LAYOUTS[layout]]
+    genotypes_b = np.tile(np.array([0, 0, 1, 1, 2, 2], dtype=np.int8), (len(variants_b), 1))
+    make = make_bfile if fmt == "bfile" else make_pfile
+    prefix_a = make(tmp_path, f"a_{name}", MULTI_GENOTYPES_A, MULTI_IDS, MULTI_VARIANTS_A)
+    prefix_b = make(tmp_path, f"b_{name}", genotypes_b, MULTI_IDS, variants_b)
+    return prefix_a, prefix_b
+
+
+@pytest.fixture(params=sorted(MULTI_LAYOUTS))
+def multi_pair(request, tmp_path):
+    """The multi-chromosome pair in one of the two dataset-2 layouts (bfile)."""
+
+    return _multi_build(tmp_path, request.param, request.param, "bfile")
+
+
+def _multi_args(prefix_a, prefix_b, out_path, extra, target=MULTI_TARGETS, fmt="bfile"):
+    flag = "--bfile1" if fmt == "bfile" else "--pfile1"
+    flag2 = "--bfile2" if fmt == "bfile" else "--pfile2"
+    return [
+        flag, prefix_a,
+        flag2, prefix_b,
+        "--ld-snps", target,
+        "--ld-window-r2", "0",
+        *extra,
+        "--out", str(out_path),
+    ]
+
+
+def _b_ids(path) -> set[str]:
+    return {row[5] for row in _read_rows(path)[1]}
+
+
+@pytest.mark.parametrize(
+    "kb, expected",
+    [
+        ("0", {"1:1000:A:G"}),
+        ("0.099", {"1:1000:A:G"}),
+        ("0.1", {"1:1000:A:G", "1:1100:A:G"}),  # boundary is inclusive
+        ("0.2", {"1:1000:A:G", "1:1100:A:G"}),
+        ("10", {"1:1000:A:G", "1:1100:A:G", "1:5000:A:G"}),
+    ],
+)
+def test_multichrom_window_kb_excludes_distant(multi_pair, tmp_path, kb, expected):
+    prefix_a, prefix_b = multi_pair
+    out_path = tmp_path / "out.vcor"
+    args = _multi_args(
+        prefix_a, prefix_b, out_path, ["--ld-window-kb", kb], target="1:1000:A:G"
+    )
+    assert cli_main(args) == 0
+    assert _b_ids(out_path) == expected
+
+
+@pytest.mark.parametrize(
+    "count, expected",
+    [
+        ("1", {"1:1000:A:G"}),
+        ("2", {"1:1000:A:G", "1:1100:A:G"}),
+        ("3", {"1:1000:A:G", "1:1100:A:G", "1:5000:A:G"}),
+    ],
+)
+def test_multichrom_window_count_keeps_nearest(multi_pair, tmp_path, count, expected):
+    """The nearest variants win by position, not by file order (interleaved)."""
+
+    prefix_a, prefix_b = multi_pair
+    out_path = tmp_path / "out.vcor"
+    args = _multi_args(
+        prefix_a,
+        prefix_b,
+        out_path,
+        ["--ld-window-kb", "10", "--ld-window", count],
+        target="1:1000:A:G",
+    )
+    assert cli_main(args) == 0
+    assert _b_ids(out_path) == expected
+
+
+def test_multichrom_window_never_leaks_across_chromosomes(multi_pair, tmp_path):
+    prefix_a, prefix_b = multi_pair
+    out_path = tmp_path / "out.vcor"
+    args = _multi_args(prefix_a, prefix_b, out_path, ["--ld-window-kb", "10"])
+    assert cli_main(args) == 0
+    _, rows = _read_rows(out_path)
+    assert rows  # both targets produced rows
+    assert all(row[0] == row[3] for row in rows)
+    # The distant same-chromosome partners are present, so the run is unbounded
+    # and a cross-chromosome leak would have been visible.
+    assert {"1:5000:A:G", "2:5000:C:T"} <= {row[5] for row in rows}
+
+
+@pytest.mark.parametrize("fmt", ["bfile", "pfile"])
+@pytest.mark.parametrize(
+    "extra",
+    [
+        ["--ld-window-kb", "10", "--ld-window", "0"],
+        ["--ld-window-kb", "10", "--ld-window", "1"],
+        ["--ld-window-kb", "0.2", "--ld-window", "0"],
+    ],
+    ids=["kb10", "nearest1", "kb0.2"],
+)
+def test_sorted_and_interleaved_layouts_agree(tmp_path, fmt, extra):
+    """File order must not change a window result, for bfile and pfile alike."""
+
+    sorted_a, sorted_b = _multi_build(tmp_path, f"sorted_{fmt}", "sorted", fmt)
+    inter_a, inter_b = _multi_build(tmp_path, f"inter_{fmt}", "interleaved", fmt)
+    sorted_out = tmp_path / "sorted.vcor"
+    inter_out = tmp_path / "interleaved.vcor"
+    assert cli_main(_multi_args(sorted_a, sorted_b, sorted_out, extra, fmt=fmt)) == 0
+    assert cli_main(_multi_args(inter_a, inter_b, inter_out, extra, fmt=fmt)) == 0
+    assert sorted_out.read_text(encoding="utf-8") == inter_out.read_text(encoding="utf-8")
+
+
+def test_window_applies_after_extract(tmp_path):
+    """Windows see only the variants surviving --extract, interleaved included."""
+
+    prefix_a, prefix_b = _multi_build(tmp_path, "extract", "interleaved", "pfile")
+    extract_path = tmp_path / "extract.txt"
+    out_path = tmp_path / "out.vcor"
+    window = ["--ld-window-kb", "10", "--ld-window", "1"]
+
+    write_extract(extract_path, ["1:1000:A:G", "1:5000:A:G"])
+    args = _multi_args(
+        prefix_a,
+        prefix_b,
+        out_path,
+        [*window, "--extract", str(extract_path)],
+        target="1:1000:A:G",
+        fmt="pfile",
+    )
+    assert cli_main(args) == 0
+    assert _b_ids(out_path) == {"1:1000:A:G"}
+
+    write_extract(extract_path, ["1:5000:A:G"])
+    args = _multi_args(
+        prefix_a,
+        prefix_b,
+        out_path,
+        [*window, "--extract", str(extract_path)],
+        target="1:1000:A:G",
+        fmt="pfile",
+    )
+    assert cli_main(args) == 0
+    assert _b_ids(out_path) == {"1:5000:A:G"}
+
+
 def test_extract_and_exclude_shrink_results(tiny_pair, tmp_path):
     prefix_a, prefix_b = tiny_pair
     extract_path = tmp_path / "extract.txt"
