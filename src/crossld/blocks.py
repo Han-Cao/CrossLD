@@ -17,8 +17,6 @@ from crossld.plinkio import PlinkDataset
 
 logger = logging.getLogger(f"{LOGGER_NAME}.blocks")
 
-MISSING = -9.0
-
 
 @dataclass(slots=True)
 class BlockStats:
@@ -183,4 +181,4 @@ class BlockReader:
         return self.reader.has_sparse(variant_idx)
 
 
-__all__ = ["MISSING", "BlockMatrix", "BlockReader", "BlockStats"]
+__all__ = ["BlockMatrix", "BlockReader", "BlockStats"]

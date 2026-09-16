@@ -86,8 +86,7 @@ def loaded_pair(sample1_prefix, sample2_prefix):
 
 def write_fam(path: Path, sample_ids: list[str]) -> None:
     with open(path, "w", encoding="utf-8") as handle:
-        for iid in sample_ids:
-            handle.write(f"0\t{iid}\t0\t0\t0\t-9\n")
+        handle.writelines(f"0\t{iid}\t0\t0\t0\t-9\n" for iid in sample_ids)
 
 
 def write_bim(path: Path, variants: list[tuple[str, str, int, str, str]]) -> None:
@@ -97,8 +96,10 @@ def write_bim(path: Path, variants: list[tuple[str, str, int, str, str]]) -> Non
     """
 
     with open(path, "w", encoding="utf-8") as handle:
-        for chrom, vid, pos, ref, alt in variants:
-            handle.write(f"{chrom}\t{vid}\t0\t{pos}\t{alt}\t{ref}\n")
+        handle.writelines(
+            f"{chrom}\t{vid}\t0\t{pos}\t{alt}\t{ref}\n" 
+            for chrom, vid, pos, ref, alt in variants
+        )
 
 
 def write_psam(path: Path, sample_ids: list[str]) -> None:
@@ -106,8 +107,7 @@ def write_psam(path: Path, sample_ids: list[str]) -> None:
 
     with open(path, "w", encoding="utf-8") as handle:
         handle.write("#IID\tSEX\n")
-        for iid in sample_ids:
-            handle.write(f"{iid}\tNA\n")
+        handle.writelines(f"{iid}\tNA\n" for iid in sample_ids)
 
 
 def write_pvar(path: Path, variants: list[tuple[str, str, int, str, str]]) -> None:
@@ -115,8 +115,10 @@ def write_pvar(path: Path, variants: list[tuple[str, str, int, str, str]]) -> No
 
     with open(path, "w", encoding="utf-8") as handle:
         handle.write("#CHROM\tPOS\tID\tREF\tALT\n")
-        for chrom, vid, pos, ref, alt in variants:
-            handle.write(f"{chrom}\t{pos}\t{vid}\t{ref}\t{alt}\n")
+        handle.writelines(
+            f"{chrom}\t{pos}\t{vid}\t{ref}\t{alt}\n" 
+            for chrom, vid, pos, ref, alt in variants
+        )
 
 
 def write_bed(path: Path, genotypes: np.ndarray, sample_ids: list[str]) -> None:

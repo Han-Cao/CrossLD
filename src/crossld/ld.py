@@ -45,7 +45,7 @@ def alt_freq_sparse(values: npt.NDArray, sample_ct: int) -> float:
 
 
 def major_allele_flipped(values: npt.NDArray) -> bool:
-    """True when the ALT-coded vector must be mirrored to represent the major allele.
+    """True when the ALT allele is the major.
 
     Returns ``True`` when the ALT allele frequency > 0.5.
     """

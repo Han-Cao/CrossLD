@@ -11,7 +11,7 @@ from __future__ import annotations
 import numpy as np
 import pytest
 
-from crossld.blocks import MISSING, BlockReader, BlockStats
+from crossld.blocks import BlockReader, BlockStats
 from crossld.plinkio import load_dataset
 from tests.conftest import make_bfile, make_dosage_pfile, make_pfile
 
@@ -92,7 +92,7 @@ def test_sparse_preserves_missing_and_nonzero_calls(tmp_path):
         block = BlockReader(ds).read([4])
         assert list(block.sparse_rows) == [0]
         values = block.sparse_values[0]
-        assert MISSING in values  # the listed -9 is not silently turned into 0
+        assert -9 in values  # the listed -9 is not silently turned into 0
         assert 2 in values
     finally:
         ds.close()
