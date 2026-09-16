@@ -314,7 +314,8 @@ def crossld(
             progress.blocks += 1
             logger.debug(
                 "block %d/%d variants=%d rows=%d-%d mode=%s "
-                "dense_variants=%d sparse_variants=%d pairs_evaluated=%d "
+                "dense_variants=%d sparse_variants=%d rows_fast=%d rows_masked=%d "
+                "pairs_evaluated=%d "
                 "pairs_kept=%d pairs_below_r2=%d pairs_skipped=%d elapsed=%.3fs",
                 block_stats.block_index,
                 max(block_stats.block_total, 1),
@@ -324,6 +325,8 @@ def crossld(
                 block_stats.mode,
                 block_stats.dense_variants,
                 block_stats.sparse_variants,
+                block_stats.fast_rows,
+                block_stats.masked_rows,
                 block_stats.pairs_evaluated,
                 block_stats.kept,
                 block_stats.below_r2,

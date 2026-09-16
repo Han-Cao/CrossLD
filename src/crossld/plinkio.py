@@ -8,7 +8,6 @@ from __future__ import annotations
 
 import logging
 import os
-from collections import defaultdict
 from dataclasses import dataclass
 
 import numpy as np
@@ -22,6 +21,117 @@ logger = logging.getLogger(f"{LOGGER_NAME}.plinkio")
 
 class PlinkIOError(Exception):
     """Fatal, user-facing error (reported as ``error: ...`` and exit code 2)."""
+
+
+@dataclass(slots=True)
+class ChromIndex:
+    """Compressed chromosome labels for a dataset's variants.
+
+    ``names`` holds the distinct chromosome labels in file order. When the file
+    is chromosome-contiguous (the common PLINK layout), ``_starts`` holds the
+    ``K + 1`` block boundaries and a variant's label is found by binary search;
+    per-chromosome variant indices are then a slice. When a chromosome appears
+    in more than one run (an interleaved file), a compact unsigned per-variant
+    code array (``_codes``) is kept instead and lookups index into ``names``.
+
+    The type is list-like over variants: ``len(chrom) == variant_ct`` and
+    ``chrom[i]`` is the label of variant ``i``.
+    """
+
+    names: list[str]
+    variant_ct: int
+    _starts: npt.NDArray[np.uint32]
+    _codes: npt.NDArray | None = None
+    _name_to_code: dict[str, int] | None = None
+    _index_cache: dict[str, npt.NDArray[np.uint32]] | None = None
+
+    @property
+    def n_chroms(self) -> int:
+        """Number of distinct chromosome labels."""
+
+        return len(self.names)
+
+    def __len__(self) -> int:
+        return self.variant_ct
+
+    def _code_dict(self) -> dict[str, int]:
+        if self._name_to_code is None:
+            self._name_to_code = {name: i for i, name in enumerate(self.names)}
+        return self._name_to_code
+
+    def _code_of(self, chrom: str) -> int | None:
+        return self._code_dict().get(chrom)
+
+    def __getitem__(self, index: int) -> str:
+        """Chromosome label of variant ``index``."""
+
+        if self._codes is not None:
+            return self.names[int(self._codes[index])]
+        code = int(np.searchsorted(self._starts, index, side="right")) - 1
+        return self.names[code]
+
+    def name(self, index: int) -> str:
+        """Explicit alias for :meth:`__getitem__`."""
+
+        return self[index]
+
+    def block(self, chrom: str) -> tuple[int, int] | None:
+        """Half-open variant range ``[start, end)`` for ``chrom``.
+
+        Returns ``None`` when the chromosome is absent, or when the file is
+        interleaved (use :meth:`indices` instead).
+        """
+
+        if self._codes is not None:
+            return None
+        code = self._code_of(chrom)
+        if code is None:
+            return None
+        return int(self._starts[code]), int(self._starts[code + 1])
+
+    def indices(self, chrom: str) -> npt.NDArray[np.uint32] | None:
+        """Ascending variant indexes for ``chrom``, or ``None`` when absent."""
+
+        code = self._code_of(chrom)
+        if code is None:
+            return None
+        if self._codes is None:
+            return np.arange(
+                self._starts[code], self._starts[code + 1], dtype=np.uint32
+            )
+        if self._index_cache is None:
+            self._index_cache = {}
+        cached = self._index_cache.get(chrom)
+        if cached is None:
+            cached = np.flatnonzero(self._codes == code).astype(np.uint32)
+            self._index_cache[chrom] = cached
+        return cached
+
+
+def _make_chrom_index(
+    names: list[str],
+    codes: npt.NDArray[np.uint32],
+    runs: list[int],
+    variant_ct: int,
+) -> ChromIndex:
+    """Build a :class:`ChromIndex` from a single-pass scan.
+
+    ``runs`` holds the start index of every maximal run of equal codes. The file
+    is contiguous exactly when there is one run per distinct label; otherwise
+    the per-variant codes are kept (downcast to the smallest unsigned dtype that
+    can hold ``len(names)`` codes).
+    """
+
+    starts = np.asarray(runs + [variant_ct], dtype=np.uint32)
+    if len(runs) == len(names):
+        return ChromIndex(names=names, variant_ct=variant_ct, _starts=starts)
+    dtype = np.uint8 if len(names) <= 256 else np.uint16
+    return ChromIndex(
+        names=names,
+        variant_ct=variant_ct,
+        _starts=starts,
+        _codes=codes.astype(dtype),
+    )
 
 
 @dataclass
@@ -50,7 +160,7 @@ class PlinkDataset:
     variant_path: str
     sample_path: str
     sample_ids: npt.NDArray[np.str_]
-    chrom: list[str]
+    chrom: ChromIndex
     pos: npt.NDArray[np.uint32]
     ids: list[str]
     _reader: pgenlib.PgenReader
@@ -127,20 +237,28 @@ class PlinkDataset:
         )
 
     def sort_pos_by_chrom(self) -> None:
-        """Build a mapping: chrom -> (positions sorted, variant indices for those positions)."""
+        """Build a mapping: chrom -> (positions sorted, variant indices for those positions).
+
+        Each chromosome's variants come from :meth:`ChromIndex.indices` (a slice
+        for chromosome-contiguous files), so no per-variant Python container is
+        built. The stable ``argsort`` is skipped when the block is already
+        position-sorted, which is the usual PLINK layout.
+        """
 
         if self._group_sort is not None:
             return
 
-        by_chrom: dict[str, list[int]] = defaultdict(list)
-        for i, c in enumerate(self.chrom):
-            by_chrom[c].append(i)
-
         group_sort: dict[str, tuple[npt.NDArray[np.uint32], npt.NDArray[np.uint32]]] = {}
-        for c, idx_list in by_chrom.items():
-            idx = np.asarray(idx_list, dtype=np.uint32)
-            order = np.argsort(self.pos[idx], kind="stable")
-            group_sort[c] = (self.pos[idx[order]], idx[order])
+        for name in self.chrom.names:
+            idx = self.chrom.indices(name)
+            if idx is None:
+                continue
+            pos = self.pos[idx]
+            if pos.size > 1 and not bool(np.all(pos[:-1] <= pos[1:])):
+                order = np.argsort(pos, kind="stable")
+                pos = pos[order]
+                idx = idx[order]
+            group_sort[name] = (pos, idx)
 
         self._group_sort = group_sort
 
@@ -426,14 +544,28 @@ def load_dataset(
             f"(max allele count {max_allele_ct})"
         )
 
-    chrom: list[str] = []
+    chrom_names: list[str] = []
+    name_to_code: dict[bytes, int] = {}
+    runs: list[int] = []
+    codes = np.empty(variant_ct, dtype=np.uint32)
     pos: list[int] = []
     ids: list[str] = []
+    last_code = -1
     for i in range(variant_ct):
-        chrom.append(pvar.get_variant_chrom(i).decode())
+        raw = pvar.get_variant_chrom(i)
+        code = name_to_code.get(raw)
+        if code is None:
+            code = len(chrom_names)
+            name_to_code[raw] = code
+            chrom_names.append(raw.decode())
+        codes[i] = code
+        if code != last_code:
+            runs.append(i)
+            last_code = code
         pos.append(pvar.get_variant_pos(i))
         ids.append(pvar.get_variant_id(i).decode())
     pos_array = np.array(pos, dtype=np.uint32)
+    chrom = _make_chrom_index(chrom_names, codes, runs, variant_ct)
 
     is_bed = genotype_path.endswith(".bed")
     reader_kwargs: dict = {"sample_subset": sample_subset}
@@ -474,7 +606,7 @@ def load_dataset(
     )
     logger.debug(
         "chroms=%s",
-        sorted(set(chrom)),
+        chrom.names,
     )
     return ds
 
@@ -577,12 +709,18 @@ def candidate_indices(
         # ~2**32 bp away instead of their true distance.
         distance = np.abs(pos_k.astype(np.int64) - pos_a)
         order = np.argsort(distance, kind="stable")[:window_count]
-        idx_k = idx_k[order]
+        return np.unique(idx_k[order])
 
+    # Variant indices inside one chromosome block are unique, so only the order
+    # matters here. A position-sorted contiguous block is already ascending;
+    # only the interleaved fallback can need a sort.
+    if idx_k.size < 2 or bool(np.all(idx_k[:-1] < idx_k[1:])):
+        return idx_k
     return np.unique(idx_k)
 
 
 __all__ = [
+    "ChromIndex",
     "PlinkDataset",
     "PlinkIOError",
     "candidate_indices",

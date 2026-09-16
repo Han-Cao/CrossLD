@@ -27,6 +27,8 @@ class BlockStats:
     variants: int = 0
     dense_variants: int = 0
     sparse_variants: int = 0
+    fast_rows: int = 0
+    masked_rows: int = 0
     pairs_evaluated: int = 0
     kept: int = 0
     below_r2: int = 0

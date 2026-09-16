@@ -103,6 +103,44 @@ def pearson_pairwise(target: npt.NDArray, block: npt.NDArray) -> tuple[npt.NDArr
     return r, n
 
 
+def pearson_pairwise_complete(
+    target: npt.NDArray, block: npt.NDArray
+) -> tuple[npt.NDArray[np.float64], npt.NDArray[np.int64]]:
+    """Pearson r between ``target`` and every row of ``block`` with no missing values.
+
+    Sum-based formulation (``n*sum_ab - sum_a*sum_b``) evaluated in float64
+    without materialising a float64 copy of ``block``, so a large block does not
+    allocate several dense temporaries the way :func:`pearson_pairwise` does.
+    Every pair uses all samples, so ``n == target.size`` for every row. The
+    ``n < 3`` and zero-variance NaN rules match :func:`pearson_pairwise`.
+    """
+
+    block = np.atleast_2d(block)
+    n = int(target.size)
+    n_rows = int(block.shape[0])
+    if n_rows == 0:
+        return np.empty(0, dtype=np.float64), np.empty(0, dtype=np.int64)
+
+    t = np.asarray(target, dtype=np.float64)
+    sum_t = float(t.sum())
+    sum_t2 = float(t @ t)
+
+    sum_b = block.sum(axis=1, dtype=np.float64)
+    sum_b2 = np.einsum("ij,ij->i", block, block, dtype=np.float64)
+    sum_tb = np.einsum("ij,j->i", block, t, dtype=np.float64)
+
+    numerator = n * sum_tb - sum_b * sum_t
+    var_b = n * sum_b2 - sum_b * sum_b
+    var_t = n * sum_t2 - sum_t * sum_t
+
+    with np.errstate(invalid="ignore", divide="ignore"):
+        r = numerator / np.sqrt(var_b * var_t)
+
+    bad = (n < 3) | (var_b <= 0) | (var_t <= 0) | ~np.isfinite(r)
+    r = np.where(bad, np.nan, r)
+    return r, np.full(n_rows, n, dtype=np.int64)
+
+
 def pearson_pairwise_sparse(
     target: np.ndarray,
     sample_idxs: list[npt.NDArray[np.uint32]],
@@ -175,33 +213,154 @@ def pearson_pairwise_sparse(
     return r_out, n_out
 
 
-def pearson_pairwise_block(target: npt.NDArray, block: BlockMatrix) -> tuple[npt.NDArray[np.float64], npt.NDArray[np.uint32]]:
+def pearson_pairwise_sparse_complete(
+    target: np.ndarray,
+    sample_idxs: list[npt.NDArray[np.uint32]],
+    values: list[npt.NDArray],
+    sample_ct: int,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Pearson r for sparse rows that contain no missing calls.
+
+    Every listed value is non-negative and ``target`` is complete, so unlisted
+    samples (exactly 0) are valid and each pair uses all ``sample_ct`` samples.
+    Rows are processed together with :func:`numpy.bincount` instead of a Python
+    loop. Empty rows have zero variance and come back as ``NaN``; the ``n < 3``
+    and zero-variance rules match :func:`pearson_pairwise_sparse`.
+    """
+
+    n_rows = len(sample_idxs)
+    r_out = np.full(n_rows, np.nan, dtype=np.float64)
+    n_out = np.full(n_rows, int(sample_ct), dtype=np.int64)
+    if n_rows == 0:
+        return r_out, n_out
+
+    t = np.asarray(target, dtype=np.float64)
+    sum_t = float(t.sum())
+    sum_t2 = float(t @ t)
+    n = float(sample_ct)
+
+    lengths = np.fromiter(
+        (np.asarray(idx).size for idx in sample_idxs), dtype=np.uint32, count=n_rows
+    )
+    row_ids = np.repeat(np.arange(n_rows, dtype=np.uint32), lengths)
+    if row_ids.size == 0:
+        return r_out, n_out
+
+    v_all = np.concatenate([np.asarray(v, dtype=np.float64) for v in values])
+    i_all = np.concatenate([np.asarray(idx, dtype=np.uint32) for idx in sample_idxs])
+
+    sum_x = np.bincount(row_ids, weights=v_all, minlength=n_rows)
+    sum_x2 = np.bincount(row_ids, weights=v_all * v_all, minlength=n_rows)
+    sum_xt = np.bincount(row_ids, weights=v_all * t[i_all], minlength=n_rows)
+
+    numerator = n * sum_xt - sum_x * sum_t
+    var_x = n * sum_x2 - sum_x * sum_x
+    var_t = n * sum_t2 - sum_t * sum_t
+
+    with np.errstate(invalid="ignore", divide="ignore"):
+        r = numerator / np.sqrt(var_x * var_t)
+
+    bad = (n < 3) | (var_x <= 0) | (var_t <= 0) | ~np.isfinite(r)
+    return np.where(bad, np.nan, r), n_out
+
+
+def pearson_pairwise_block(
+    target: npt.NDArray,
+    block: BlockMatrix,
+    *,
+    force_masked: bool = False,
+) -> tuple[npt.NDArray[np.float64], npt.NDArray[np.uint32]]:
     """Pearson r between ``target`` and a :class:`crossld.blocks.BlockMatrix`.
 
     Returns ``(r, n)`` aligned with the block's requested row order (dense and
     sparse rows interleaved as they were requested). ``block`` is duck-typed
     (``dense``, ``dense_rows``, ``sparse_rows``, ``sparse_sample_idxs``,
     ``sparse_values``, ``stats``) so this module does not import ``blocks``.
+
+    Rows without missing calls (and a complete ``target``) take a sum-based fast
+    path; rows holding missing values keep the pairwise-masked path. Pass
+    ``force_masked=True`` to disable the fast path (routing only, identical
+    results) for differential tests and debugging. ``block.stats.fast_rows`` /
+    ``block.stats.masked_rows`` record how many rows took each path.
     """
 
     n_rows = int(block.stats.variants)
     r = np.full(n_rows, np.nan, dtype=np.float64)
     n = np.zeros(n_rows, dtype=np.uint32)
 
-    # TODO:
-    # faster path for data without NAs, this is more common case for LD analysis
+    target = np.asarray(target)
+    target_clean = (not force_masked) and bool(np.all(target >= 0))
+    fast_rows = 0
+    masked_rows = 0
+
     if block.dense_rows.size:
-        r_dense, n_dense = pearson_pairwise(target, block.dense)
-        r[block.dense_rows] = r_dense
-        n[block.dense_rows] = n_dense
+        dense = block.dense
+        rows = block.dense_rows
+        row_clean = (
+            dense.min(axis=1) >= 0
+            if target_clean
+            else np.zeros(dense.shape[0], dtype=bool)
+        )
+        if row_clean.all():
+            r[rows], n[rows] = pearson_pairwise_complete(target, dense)
+            fast_rows += int(dense.shape[0])
+        elif not row_clean.any():
+            r[rows], n[rows] = pearson_pairwise(target, dense)
+            masked_rows += int(dense.shape[0])
+        else:
+            fast_idx = np.flatnonzero(row_clean)
+            masked_idx = np.flatnonzero(~row_clean)
+            r[rows[fast_idx]], n[rows[fast_idx]] = pearson_pairwise_complete(
+                target, dense[fast_idx]
+            )
+            r[rows[masked_idx]], n[rows[masked_idx]] = pearson_pairwise(
+                target, dense[masked_idx]
+            )
+            fast_rows += int(fast_idx.size)
+            masked_rows += int(masked_idx.size)
 
     if block.sparse_rows.size:
-        r_sparse, n_sparse = pearson_pairwise_sparse(
-            target, block.sparse_sample_idxs, block.sparse_values
+        sample_idxs = block.sparse_sample_idxs
+        values = block.sparse_values
+        rows = block.sparse_rows
+        row_clean = (
+            np.fromiter(
+                (v.size == 0 or bool(np.all(v >= 0)) for v in values),
+                dtype=bool,
+                count=len(values),
+            )
+            if target_clean
+            else np.zeros(len(values), dtype=bool)
         )
-        r[block.sparse_rows] = r_sparse
-        n[block.sparse_rows] = n_sparse
+        if row_clean.all():
+            r[rows], n[rows] = pearson_pairwise_sparse_complete(
+                target, sample_idxs, values, target.size
+            )
+            fast_rows += len(values)
+        elif not row_clean.any():
+            r[rows], n[rows] = pearson_pairwise_sparse(
+                target, sample_idxs, values
+            )
+            masked_rows += len(values)
+        else:
+            fast_idx = np.flatnonzero(row_clean)
+            masked_idx = np.flatnonzero(~row_clean)
+            r[rows[fast_idx]], n[rows[fast_idx]] = pearson_pairwise_sparse_complete(
+                target,
+                [sample_idxs[k] for k in fast_idx],
+                [values[k] for k in fast_idx],
+                target.size,
+            )
+            r[rows[masked_idx]], n[rows[masked_idx]] = pearson_pairwise_sparse(
+                target,
+                [sample_idxs[k] for k in masked_idx],
+                [values[k] for k in masked_idx],
+            )
+            fast_rows += int(fast_idx.size)
+            masked_rows += int(masked_idx.size)
 
+    block.stats.fast_rows += fast_rows
+    block.stats.masked_rows += masked_rows
     return r, n
 
 
@@ -214,5 +373,7 @@ __all__ = [
     "major_allele_flipped_sparse",
     "pearson_pairwise",
     "pearson_pairwise_block",
+    "pearson_pairwise_complete",
     "pearson_pairwise_sparse",
+    "pearson_pairwise_sparse_complete",
 ]
