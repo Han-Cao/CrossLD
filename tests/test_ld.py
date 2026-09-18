@@ -395,7 +395,7 @@ def test_sparse_complete_matches_masked_and_oracle():
     idxs, values = zip(*[_sparsify(row) for row in block])
     r_masked, n_masked = pearson_pairwise_sparse(target, list(idxs), list(values))
     r_fast, n_fast = pearson_pairwise_sparse_complete(
-        target, list(idxs), list(values), sample_ct=180
+        target, list(idxs), list(values)
     )
     assert np.array_equal(n_masked, n_fast)
     assert np.allclose(r_masked, r_fast, atol=1e-12, equal_nan=True)
@@ -410,7 +410,7 @@ def test_sparse_complete_matches_masked_and_oracle():
 def test_sparse_complete_empty_and_empty_rows():
     idxs = [np.empty(0, dtype=np.uint32), np.array([1, 2], dtype=np.uint32)]
     values = [np.empty(0), np.array([1.0, 2.0])]
-    r, n = pearson_pairwise_sparse_complete(TARGET, idxs, values, sample_ct=6)
+    r, n = pearson_pairwise_sparse_complete(TARGET, idxs, values)
     assert np.isnan(float(r[0]))  # empty row -> zero variance
     assert int(n[0]) == 6
     assert np.isfinite(float(r[1]))

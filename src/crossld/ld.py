@@ -78,7 +78,7 @@ def pearson_pairwise(target: npt.NDArray, block: npt.NDArray) -> tuple[npt.NDArr
     valid_b = block >= 0
     valid = valid_a[None, :] & valid_b
 
-    n = valid.sum(axis=1)
+    n = valid.sum(axis=1, dtype=np.uint32)
     a = np.where(valid, target[None, :], 0.0)
     b = np.where(valid, block, 0.0)
 
@@ -105,7 +105,7 @@ def pearson_pairwise(target: npt.NDArray, block: npt.NDArray) -> tuple[npt.NDArr
 
 def pearson_pairwise_complete(
     target: npt.NDArray, block: npt.NDArray
-) -> tuple[npt.NDArray[np.float64], npt.NDArray[np.int64]]:
+) -> tuple[npt.NDArray[np.float64], npt.NDArray[np.uint32]]:
     """Pearson r between ``target`` and every row of ``block`` with no missing values.
 
     Sum-based formulation (``n*sum_ab - sum_a*sum_b``) evaluated in float64
@@ -116,10 +116,10 @@ def pearson_pairwise_complete(
     """
 
     block = np.atleast_2d(block)
-    n = int(target.size)
     n_rows = int(block.shape[0])
     if n_rows == 0:
-        return np.empty(0, dtype=np.float64), np.empty(0, dtype=np.int64)
+        return np.empty(0, dtype=np.float64), np.empty(0, dtype=np.uint32)
+    n = int(target.size)
 
     t = np.asarray(target, dtype=np.float64)
     sum_t = float(t.sum())
@@ -138,7 +138,7 @@ def pearson_pairwise_complete(
 
     bad = (n < 3) | (var_b <= 0) | (var_t <= 0) | ~np.isfinite(r)
     r = np.where(bad, np.nan, r)
-    return r, np.full(n_rows, n, dtype=np.int64)
+    return r, np.full(n_rows, n, dtype=np.uint32)
 
 
 def pearson_pairwise_sparse(
@@ -148,8 +148,10 @@ def pearson_pairwise_sparse(
 ) -> tuple[np.ndarray, np.ndarray]:
     """Pearson r between ``target`` and one or more sparse block rows.
 
-    ``sample_idxs``/``values`` are the per-row sparse arrays (a single row may be
-    passed directly). Returns ``(r, n)`` per row with the same NaN rules as
+    ``sample_idxs`` and ``values`` are lists containing one sparse array per row.
+    To process one row, pass one-element lists: ``[idx]`` and ``[values]``.
+
+    Returns ``(r, n)`` per row with the same NaN rules as
     :func:`pearson_pairwise`; the per-row masked sums are computed without
     densifying.
     """
@@ -162,7 +164,7 @@ def pearson_pairwise_sparse(
 
     n_rows = len(sample_idxs)
     r_out = np.full(n_rows, np.nan, dtype=np.float64)
-    n_out = np.zeros(n_rows, dtype=np.int64)
+    n_out = np.zeros(n_rows, dtype=np.uint32)
 
     for k in range(n_rows):
         idx = sample_idxs[k]
@@ -216,35 +218,32 @@ def pearson_pairwise_sparse(
 def pearson_pairwise_sparse_complete(
     target: np.ndarray,
     sample_idxs: list[npt.NDArray[np.uint32]],
-    values: list[npt.NDArray],
-    sample_ct: int,
+    values: list[npt.NDArray]
 ) -> tuple[np.ndarray, np.ndarray]:
     """Pearson r for sparse rows that contain no missing calls.
 
     Every listed value is non-negative and ``target`` is complete, so unlisted
-    samples (exactly 0) are valid and each pair uses all ``sample_ct`` samples.
+    samples (exactly 0) are valid and each pair uses all samples (target.size).
     Rows are processed together with :func:`numpy.bincount` instead of a Python
     loop. Empty rows have zero variance and come back as ``NaN``; the ``n < 3``
     and zero-variance rules match :func:`pearson_pairwise_sparse`.
     """
 
     n_rows = len(sample_idxs)
-    r_out = np.full(n_rows, np.nan, dtype=np.float64)
-    n_out = np.full(n_rows, int(sample_ct), dtype=np.int64)
     if n_rows == 0:
-        return r_out, n_out
+        return np.empty(0, dtype=np.float64), np.empty(0, dtype=np.uint32)
+    n = int(target.size)
 
     t = np.asarray(target, dtype=np.float64)
     sum_t = float(t.sum())
     sum_t2 = float(t @ t)
-    n = float(sample_ct)
 
     lengths = np.fromiter(
-        (np.asarray(idx).size for idx in sample_idxs), dtype=np.uint32, count=n_rows
+        (idx.size for idx in sample_idxs), dtype=np.uint32, count=n_rows
     )
     row_ids = np.repeat(np.arange(n_rows, dtype=np.uint32), lengths)
     if row_ids.size == 0:
-        return r_out, n_out
+        return np.empty(0, dtype=np.float64), np.empty(0, dtype=np.uint32)
 
     v_all = np.concatenate([np.asarray(v, dtype=np.float64) for v in values])
     i_all = np.concatenate([np.asarray(idx, dtype=np.uint32) for idx in sample_idxs])
@@ -261,7 +260,8 @@ def pearson_pairwise_sparse_complete(
         r = numerator / np.sqrt(var_x * var_t)
 
     bad = (n < 3) | (var_x <= 0) | (var_t <= 0) | ~np.isfinite(r)
-    return np.where(bad, np.nan, r), n_out
+    r = np.where(bad, np.nan, r)
+    return r, np.full(n_rows, n, dtype=np.uint32)
 
 
 def pearson_pairwise_block(
@@ -273,9 +273,7 @@ def pearson_pairwise_block(
     """Pearson r between ``target`` and a :class:`crossld.blocks.BlockMatrix`.
 
     Returns ``(r, n)`` aligned with the block's requested row order (dense and
-    sparse rows interleaved as they were requested). ``block`` is duck-typed
-    (``dense``, ``dense_rows``, ``sparse_rows``, ``sparse_sample_idxs``,
-    ``sparse_values``, ``stats``) so this module does not import ``blocks``.
+    sparse rows interleaved as they were requested).
 
     Rows without missing calls (and a complete ``target``) take a sum-based fast
     path; rows holding missing values keep the pairwise-masked path. Pass
@@ -288,28 +286,27 @@ def pearson_pairwise_block(
     r = np.full(n_rows, np.nan, dtype=np.float64)
     n = np.zeros(n_rows, dtype=np.uint32)
 
-    target = np.asarray(target)
-    target_clean = (not force_masked) and bool(np.all(target >= 0))
+    target_complete = (not force_masked) and bool(np.all(target >= 0))
     fast_rows = 0
     masked_rows = 0
 
     if block.dense_rows.size:
         dense = block.dense
         rows = block.dense_rows
-        row_clean = (
-            dense.min(axis=1) >= 0
-            if target_clean
+        row_complete = (
+            np.all(dense >= 0, axis=1)
+            if target_complete
             else np.zeros(dense.shape[0], dtype=bool)
         )
-        if row_clean.all():
+        if row_complete.all():
             r[rows], n[rows] = pearson_pairwise_complete(target, dense)
             fast_rows += int(dense.shape[0])
-        elif not row_clean.any():
+        elif not row_complete.any():
             r[rows], n[rows] = pearson_pairwise(target, dense)
             masked_rows += int(dense.shape[0])
         else:
-            fast_idx = np.flatnonzero(row_clean)
-            masked_idx = np.flatnonzero(~row_clean)
+            fast_idx = np.flatnonzero(row_complete)
+            masked_idx = np.flatnonzero(~row_complete)
             r[rows[fast_idx]], n[rows[fast_idx]] = pearson_pairwise_complete(
                 target, dense[fast_idx]
             )
@@ -323,33 +320,32 @@ def pearson_pairwise_block(
         sample_idxs = block.sparse_sample_idxs
         values = block.sparse_values
         rows = block.sparse_rows
-        row_clean = (
+        row_complete = (
             np.fromiter(
                 (v.size == 0 or bool(np.all(v >= 0)) for v in values),
                 dtype=bool,
                 count=len(values),
             )
-            if target_clean
+            if target_complete
             else np.zeros(len(values), dtype=bool)
         )
-        if row_clean.all():
+        if row_complete.all():
             r[rows], n[rows] = pearson_pairwise_sparse_complete(
-                target, sample_idxs, values, target.size
+                target, sample_idxs, values
             )
             fast_rows += len(values)
-        elif not row_clean.any():
+        elif not row_complete.any():
             r[rows], n[rows] = pearson_pairwise_sparse(
                 target, sample_idxs, values
             )
             masked_rows += len(values)
         else:
-            fast_idx = np.flatnonzero(row_clean)
-            masked_idx = np.flatnonzero(~row_clean)
+            fast_idx = np.flatnonzero(row_complete)
+            masked_idx = np.flatnonzero(~row_complete)
             r[rows[fast_idx]], n[rows[fast_idx]] = pearson_pairwise_sparse_complete(
                 target,
                 [sample_idxs[k] for k in fast_idx],
                 [values[k] for k in fast_idx],
-                target.size,
             )
             r[rows[masked_idx]], n[rows[masked_idx]] = pearson_pairwise_sparse(
                 target,
