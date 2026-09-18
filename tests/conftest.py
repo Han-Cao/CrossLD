@@ -247,6 +247,50 @@ def pearson_reference(target: np.ndarray, row: np.ndarray) -> float:
     return float(np.corrcoef(x, y)[0, 1])
 
 
+def pearson_reference_stable(target: np.ndarray, row: np.ndarray) -> tuple[float, int]:
+    """Extra-stable one-pair Pearson oracle, independent of the LD kernels.
+
+    Unlike :func:`pearson_reference` this is deliberately written to survive the
+    hazards of the kernels it checks:
+
+    * shift each side by its first valid value, so an exactly constant pair
+      becomes exactly zero and is reported ``NaN`` (mean subtraction of a
+      constant float vector is not exact);
+    * scale by the largest shifted magnitude before squaring, so extreme dosages
+      cannot underflow the variance product;
+    * center and use the centered formulation rather than raw moments;
+    * clip the final result (the mathematical range is ``[-1, 1]``).
+
+    Returns ``(r, n)`` with the same contract as :func:`crossld.ld.pearson_pairwise`.
+    """
+
+    target = np.asarray(target, dtype=float)
+    row = np.asarray(row, dtype=float)
+    valid = (target >= 0) & (row >= 0)
+    n = int(valid.sum())
+    if n < 3:
+        return float("nan"), n
+
+    x = target[valid]
+    y = row[valid]
+    x = x - x[0]
+    y = y - y[0]
+
+    sx = float(np.max(np.abs(x)))
+    sy = float(np.max(np.abs(y)))
+    if sx == 0.0 or sy == 0.0:
+        return float("nan"), n
+
+    x = x / sx
+    y = y / sy
+    x = x - x.mean()
+    y = y - y.mean()
+    denom = float(np.sqrt(x @ x)) * float(np.sqrt(y @ y))
+    if denom == 0.0:
+        return float("nan"), n
+    return float(np.clip((x @ y) / denom, -1.0, 1.0)), n
+
+
 __all__ = [
     "DATA_DIR",
     "FIXTURE_DIR",
@@ -255,6 +299,7 @@ __all__ = [
     "make_dosage_pfile",
     "make_pfile",
     "pearson_reference",
+    "pearson_reference_stable",
     "write_bed",
     "write_bed_intervals",
     "write_bim",
