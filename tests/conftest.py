@@ -232,7 +232,7 @@ def pearson_reference(target: np.ndarray, row: np.ndarray) -> float:
 
     Missing calls are negative values on either side. Returns ``NaN`` when
     fewer than three samples are usable or either side has zero variance, the
-    same contract as :func:`crossld.ld.pearson_pairwise`.
+    same contract as :func:`crossld.ld.centered_moment_ld_dense`.
     """
 
     target = np.asarray(target, dtype=float)
@@ -261,7 +261,7 @@ def pearson_reference_stable(target: np.ndarray, row: np.ndarray) -> tuple[float
     * center and use the centered formulation rather than raw moments;
     * clip the final result (the mathematical range is ``[-1, 1]``).
 
-    Returns ``(r, n)`` with the same contract as :func:`crossld.ld.pearson_pairwise`.
+    Returns ``(r, n)`` with the same contract as :func:`crossld.ld.centered_moment_ld_dense`.
     """
 
     target = np.asarray(target, dtype=float)

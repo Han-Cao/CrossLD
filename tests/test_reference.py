@@ -27,7 +27,7 @@ import pytest
 
 from crossld.blocks import BlockReader
 from crossld.crossld import main as cli_main
-from crossld.ld import major_allele_flipped, pearson_pairwise
+from crossld.ld import centered_moment_ld_dense, major_allele_flipped
 from crossld.plinkio import (
     load_dataset,
     load_two_datasets,
@@ -123,7 +123,7 @@ class _RawVectors:
         raise ValueError(mode)
 
     def r(self, ti: int, bi: int, mode: str) -> float:
-        r, _ = pearson_pairwise(
+        r, _ = centered_moment_ld_dense(
             self.code(self.a[ti], mode), self.code(self.b[bi], mode).reshape(1, -1)
         )
         return float(r[0])

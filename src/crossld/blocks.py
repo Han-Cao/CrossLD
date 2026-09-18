@@ -20,15 +20,28 @@ logger = logging.getLogger(f"{LOGGER_NAME}.blocks")
 
 @dataclass(slots=True)
 class BlockStats:
-    """Per-block statistics emitted at DEBUG level."""
+    """Per-block statistics emitted at DEBUG level.
+
+    The pair counters describe two independent partitions of the block's
+    evaluated variant pairs:
+
+    * ``complete_pair`` / ``incomplete_pair`` -- whether the block row has a
+      valid call on every sample the target observes (complete) or not
+      (incomplete).
+    * ``raw_moment_pair`` / ``centered_moment_pair`` -- which LD method produced
+      the result: the raw-moment method, or the centered-moment method used as
+      the precision fallback (or for every pair under ``force_centered``).
+    """
 
     block_index: int = 1
     block_total: int = 1
     variants: int = 0
     dense_variants: int = 0
     sparse_variants: int = 0
-    fast_rows: int = 0
-    masked_rows: int = 0
+    complete_pair: int = 0
+    incomplete_pair: int = 0
+    raw_moment_pair: int = 0
+    centered_moment_pair: int = 0
     pairs_evaluated: int = 0
     kept: int = 0
     below_r2: int = 0
