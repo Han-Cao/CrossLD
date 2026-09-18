@@ -170,7 +170,7 @@ class PlinkDataset:
     sample_subset: npt.NDArray[np.uint32] | None = None
     idx_bridge: npt.NDArray[np.uint32] | None = None
     dosage: bool = False
-    _vid_index: dict[str, int] | None = None
+    # _vid_index: dict[str, int] | None = None
     _group_sort: dict[str, tuple[npt.NDArray[np.uint32], npt.NDArray[np.uint32]]] | None = None
     _variant_mask: npt.NDArray[np.bool_] | None = None
 
@@ -196,16 +196,30 @@ class PlinkDataset:
 
         return self._reader
 
-    def build_vid_index(self) -> None:
-        """Build the variant-ID lookup, idempotently."""
+    # this index cannot handle duplicated ids
+    # def build_vid_index(self) -> None:
+    #     """Build the variant-ID lookup, idempotently."""
 
-        if self._vid_index is None:
-            self._vid_index = {vid: i for i, vid in enumerate(self.ids)}
+    #     if self._vid_index is None:
+    #         self._vid_index = {vid: i for i, vid in enumerate(self.ids)}
 
-    def index_of(self, variant_id: str) -> int | None:
-        if self._vid_index is None:
-            self.build_vid_index()
-        return self._vid_index.get(variant_id)
+    def indices_of(self, variant_ids: list[str]) -> tuple[npt.NDArray[np.uint32], int, int]:
+        """Find variant indices for a list of variant IDs in the dataset.
+           
+           Return (indices, n_miss, n_duphit)
+        """
+
+        all_ids = np.asarray(self.ids)
+        query_ids = np.unique(np.asarray(variant_ids))
+
+        mask = np.isin(all_ids, query_ids)
+        n_uniq_hit = np.unique(all_ids[mask]).size
+        # find miss and duplicated ids
+        n_miss = query_ids.size - n_uniq_hit
+        n_duphit = mask.sum() - n_uniq_hit
+
+        return np.flatnonzero(mask).astype(np.uint32), n_miss, n_duphit
+    
 
     def ref_allele(self, index: int) -> str:
         """Decoded REF allele for a variant, read on demand from the pvar/bim reader."""
@@ -504,7 +518,6 @@ def load_two_datasets(
     ds1 = load_dataset(
         prefix1, fmt1, samples1, dosage1, sample_subset1, idx_bridge,
     )
-    ds1.build_vid_index()
 
     # load dataset 2
     # dataset 2 always query by position, sort it here
@@ -648,7 +661,6 @@ def resolve_targets(
 
     ids: list[str] = []
     indices: list[int] = []
-    seen: set[str] = set()
     if single is not None:
         ids.append(single)
     if snps is not None:
@@ -656,22 +668,13 @@ def resolve_targets(
     if snp_list is not None:
         ids += read_ld_snp_list(snp_list)
 
-    n_miss = 0
-    for vid in ids:
-        if vid in seen:
-            continue
-
-        seen.add(vid)
-        index = ds.index_of(vid)
-        if index is None:
-            n_miss += 1
-            continue
-        indices.append(index)
-    # sort indices to respect the variant order in dataset 1
-    indices.sort()
+    indices, n_miss, n_duphit = ds.indices_of(ids)
     if n_miss > 0:
         logger.warning("%d target LD variants not found in dataset 1", n_miss)
-    return indices
+    if n_duphit > 0:
+        logger.warning("%d target LD variants have duplicated records in dataset 1", n_duphit)
+
+    return indices.tolist()
 
 
 def candidate_indices(

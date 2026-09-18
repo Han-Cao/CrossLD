@@ -64,8 +64,9 @@ class BlockReader:
 
     Notes for precision:
     Based on tests, PLINK2's LD is estimated in float64, to replicate the same precision,
-    we also use np.float64 for all dosages and downstream LD calaculation. If memory is
-    a concern, then should not use the --dosage option.
+    we also use np.float64 for all dosages and downstream LD calaculation.
+    
+    TODO: consider make --float32 as a optional flag
     """
 
     dataset: PlinkDataset

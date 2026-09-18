@@ -430,7 +430,9 @@ def test_r2_values_match_alt_coded_correlation(
     _, truth = _parse(truth_r2_path)
     checked = 0
     for row in _comparable(truth, current_b_ids):
-        r = raw_vectors.r(ds1.index_of(row[2]), ds2.index_of(row[5]), "alt")
+        # ds.indices_of return a tuple, where the first element is a list
+        # to get index of one variant, do [0][0]
+        r = raw_vectors.r(ds1.indices_of([row[2]])[0][0], ds2.indices_of([row[5]])[0][0], "alt")
         assert r * r == pytest.approx(float(row[6]), abs=1e-5), f"{(row[2], row[5])}"
         checked += 1
     assert checked == TRUTH_ROWS
@@ -443,7 +445,7 @@ def test_r_ref_values_and_allele_columns(raw_vectors, truth_r_ref_path, current_
     _, truth = _parse(truth_r_ref_path)
     checked = 0
     for row in _comparable(truth, current_b_ids, b_col=6):
-        ti, bi = ds1.index_of(row[2]), ds2.index_of(row[6])
+        ti, bi = ds1.indices_of([row[2]])[0][0], ds2.indices_of([row[6]])[0][0]
         assert (row[3], row[7]) == raw_vectors.ref(ti, bi), f"REF columns {(row[2], row[6])}"
         assert raw_vectors.r(ti, bi, "ref") == pytest.approx(
             float(row[8]), abs=1e-5
@@ -461,7 +463,7 @@ def test_r_major_values_and_allele_columns(
     _, truth = _parse(truth_r_major_path)
     checked = 0
     for row in _comparable(truth, current_b_ids, b_col=6):
-        ti, bi = ds1.index_of(row[2]), ds2.index_of(row[6])
+        ti, bi = ds1.indices_of([row[2]])[0][0], ds2.indices_of([row[6]])[0][0]
         assert (row[3], row[7]) == raw_vectors.major(ti, bi), f"MAJ columns {(row[2], row[6])}"
         assert raw_vectors.r(ti, bi, "major") == pytest.approx(
             float(row[8]), abs=1e-5
@@ -476,7 +478,7 @@ def test_r_major_and_ref_agree_up_to_sign(raw_vectors, current_b_ids, truth_r_ma
     ds1, ds2 = raw_vectors.ds1, raw_vectors.ds2
     _, truth = _parse(truth_r_major_path)
     for row in _comparable(truth, current_b_ids, b_col=6):
-        ti, bi = ds1.index_of(row[2]), ds2.index_of(row[6])
+        ti, bi = ds1.indices_of([row[2]])[0][0], ds2.indices_of([row[6]])[0][0]
         major = raw_vectors.r(ti, bi, "major")
         ref = raw_vectors.r(ti, bi, "ref")
         assert abs(major) == pytest.approx(abs(ref), abs=1e-9)

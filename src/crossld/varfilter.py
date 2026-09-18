@@ -72,22 +72,22 @@ class VariantFilter:
 
         logger.info("Filtering variants in dataset 2:")
         if self.extract:
-            idx_extract, matched, requested = _match_variant_indices(
+            idx_extract, unmatched, requested = _match_variant_indices(
                 ds, read_vid_file(self.extract)
             )
             self._warn_unmatched(
-                "--extract", self.extract, requested - matched, requested
+                "--extract", self.extract, unmatched, requested
             )
             mask[idx_extract] = True
         if self.extract_bed:
             mask |= _in_intervals(ds, read_bed_file(self.extract_bed))
 
         if self.exclude:
-            idx_exclude, matched, requested = _match_variant_indices(
+            idx_exclude, unmatched, requested = _match_variant_indices(
                 ds, read_vid_file(self.exclude)
             )
             self._warn_unmatched(
-                "--exclude", self.exclude, requested - matched, requested
+                "--exclude", self.exclude, unmatched, requested
             )
             mask[idx_exclude] = False
         if self.exclude_bed:
@@ -132,23 +132,14 @@ def _match_variant_indices(
 ) -> tuple[npt.NDArray[np.uint32], int, int]:
     """Resolve a variant-ID list against ``ds``.
 
-    Returns ``(indices, matched, requested)``: the ascending dataset indexes of
-    the requested IDs that exist (deduplicated), plus the matched/requested
-    counts used for the unmatched warning.
+    Returns ``(indices, unmatched, requested)``: the ascending dataset indexes of
+    the requested IDs that exist, plus the unmatched/requested counts used for warning.
     """
 
-    ds.build_vid_index()
-    requested_ids = set(ids)
-    indices: list[int] = []
-    matched = 0
-    for vid in requested_ids:
-        index = ds.index_of(vid)
-        if index is None:
-            continue
-        matched += 1
-        indices.append(index)
-    indices.sort()
-    return np.asarray(indices, dtype=np.uint32), matched, len(requested_ids)
+    n_query = len(set(ids))
+    indices, n_miss, _ = ds.indices_of(ids)
+
+    return indices, n_miss, n_query
 
 
 def read_vid_file(path: str) -> list[str]:

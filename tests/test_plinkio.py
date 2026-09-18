@@ -153,8 +153,8 @@ def test_load_dataset_reads_metadata(synthetic_pair):
     assert [ds1.chrom[i] for i in range(ds1.variant_ct)] == ["1", "2"]
     assert list(ds1.pos) == [1000, 1000]
     assert ds1.ref_allele(0) == "A" and ds1.alt_allele(0) == "G"
-    assert ds1.index_of("2:1000:C:T") == 1
-    assert ds1.index_of("nope") is None
+    assert ds1.indices_of(["2:1000:C:T"])[0] == 1
+    assert len(ds1.indices_of(["nope"])[0]) == 0
 
 
 def test_load_dataset_rejects_missing_files_and_bad_format(tmp_path):
