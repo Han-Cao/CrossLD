@@ -293,10 +293,8 @@ def test_chrom_index_contiguous_blocks(tmp_path):
         assert ds.chrom.n_chroms == 2
         assert len(ds.chrom) == 5
         assert [ds.chrom[i] for i in range(5)] == ["1", "1", "2", "2", "2"]
-        assert ds.chrom.name(4) == "2"
-        assert ds.chrom.block("1") == (0, 2)
-        assert ds.chrom.block("2") == (2, 5)
-        assert ds.chrom.block("9") is None
+        assert ds.chrom[4] == "2"
+        assert list(ds.chrom.indices("1")) == [0, 1]
         assert list(ds.chrom.indices("2")) == [2, 3, 4]
         assert ds.chrom.indices("9") is None
     finally:
@@ -310,7 +308,6 @@ def test_chrom_index_interleaved_uses_codes(tmp_path):
     try:
         assert ds.chrom.names == ["1", "2"]
         assert ds.chrom._codes is not None  # interleaved -> code-array fallback
-        assert ds.chrom.block("1") is None
         assert list(ds.chrom.indices("1")) == [0, 2]
         assert list(ds.chrom.indices("2")) == [1, 3]
         assert [ds.chrom[i] for i in range(4)] == ["1", "2", "1", "2"]
