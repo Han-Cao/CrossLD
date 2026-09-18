@@ -162,8 +162,8 @@ def test_dosage_reads_match_hardcalls_on_hardcall_data(tmp_path):
         dos = reader_dos.read([1, 3, 5])
         np.testing.assert_allclose(dos.dense, hard.dense)
         assert dos.stats.mode == "dosage"
-        assert reader_dos.arr_dtype == np.float32
-        assert hard.dense.dtype == np.int8 and dos.dense.dtype == np.float32
+        assert reader_dos.arr_dtype == np.float64
+        assert hard.dense.dtype == np.int8 and dos.dense.dtype == np.float64
     finally:
         ds.close()
 
@@ -175,7 +175,7 @@ def test_sparse_dosage_path_matches_dense(tmp_path):
             [0.5] + [0.0] * 19,
             [1.0, 1.0] + [0.0] * 16 + [2.0, 2.0],
         ],
-        dtype=np.float32,
+        dtype=np.float64,
     )
     variants = [
         ("1", f"1:{100 * (i + 1)}:A:G", 100 * (i + 1), "A", "G")

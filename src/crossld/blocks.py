@@ -58,9 +58,14 @@ class BlockMatrix:
 
 @dataclass
 class BlockReader:
-    """Reads variant blocks as int8 hardcalls or float32 dosages on the active subset.
+    """Reads variant blocks as int8 hardcalls or float64 dosages on the active subset.
 
     For sparse variants, the reader always read the alt alelle (pgenlib's default).
+
+    Notes for precision:
+    Based on tests, PLINK2's LD is estimated in float64, to replicate the same precision,
+    we also use np.float64 for all dosages and downstream LD calaculation. If memory is
+    a concern, then should not use the --dosage option.
     """
 
     dataset: PlinkDataset
@@ -71,7 +76,7 @@ class BlockReader:
         self.reader = self.dataset.reader
         self.fmt = self.dataset.fmt
         if self.dosage:
-            self.arr_dtype = np.float32
+            self.arr_dtype = np.float64
         else:
             self.arr_dtype = np.int8
 
@@ -157,7 +162,7 @@ class BlockReader:
         lst_values: list[npt.NDArray] = []
         for idx in idx_array.tolist():
             if self.dosage:
-                sample_idxs, values = self.reader.read_sparse_dosages32(idx)
+                sample_idxs, values = self.reader.read_sparse_dosages64(idx)
             else:
                 sample_idxs, values = self.reader.read_sparse8(idx)
             lst_sample_idxs.append(np.asarray(sample_idxs, dtype=np.uint32))
