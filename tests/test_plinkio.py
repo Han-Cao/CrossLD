@@ -8,6 +8,7 @@ import pytest
 from crossld.plinkio import (
     PlinkIOError,
     candidate_indices,
+    iter_target_candidates,
     load_dataset,
     load_two_datasets,
     parse_sample,
@@ -405,3 +406,63 @@ def test_candidate_window_for_missing_chrom_is_empty(synthetic_pair):
     mask[0] = True  # keep only a chrom-1 variant
     ds2.apply_variant_filter(mask)
     assert candidate_indices(ds1, ds2, 1, 10.0, 0).size == 0  # target is on chrom 2
+
+
+# --------------------------------------------------------------------------- #
+# target/candidate prefetch
+# --------------------------------------------------------------------------- #
+
+def _loaded_pfile(tmp_path, name, positions):
+    variants = _chrom_variants(["1"] * len(positions), positions)
+    prefix = make_pfile(tmp_path, name, _genotypes(len(positions)), SAMPLES, variants)
+    ds = load_dataset(prefix, "pfile", np.array(SAMPLES))
+    ds.sort_pos_by_chrom()
+    return ds
+
+
+def test_iter_target_candidates_empty_targets(synthetic_pair):
+    ds1, ds2 = synthetic_pair
+    assert list(iter_target_candidates(ds1, ds2, [], 10.0, 0)) == []
+
+
+def test_iter_target_candidates_prefetches_each_window_once(synthetic_pair):
+    ds1, ds2 = synthetic_pair
+    steps = list(iter_target_candidates(ds1, ds2, [0, 1], 10.0, 0))
+    assert [step[0] for step in steps] == [0, 1]
+    # Windows are computed one step ahead and match a direct call.
+    assert np.array_equal(steps[0][1], candidate_indices(ds1, ds2, 0, 10.0, 0))
+    assert np.array_equal(steps[1][1], candidate_indices(ds1, ds2, 1, 10.0, 0))
+    # Target 0 (chrom 1) and target 1 (chrom 2) cannot share candidates, and
+    # the last target has no successor.
+    assert steps[0][2].size == 0
+    assert steps[1][2].size == 0
+
+
+def test_iter_target_candidates_keep_is_next_window_on_same_chrom(tmp_path):
+    ds1 = _loaded_pfile(tmp_path, "same_targets", [1000, 1200])
+    ds2 = _loaded_pfile(tmp_path, "same_candidates", [500, 1000, 1200, 2000])
+    try:
+        steps = list(iter_target_candidates(ds1, ds2, [0, 1], 10.0, 0))
+        assert np.array_equal(steps[0][2], candidate_indices(ds1, ds2, 1, 10.0, 0))
+        assert steps[0][2].size > 0
+    finally:
+        ds1.close()
+        ds2.close()
+
+
+@pytest.mark.parametrize(
+    "positions, overlap",
+    [
+        ([1000, 3000], True),   # exactly 2 * window radius: edge is shared
+        ([1000, 3001], False),  # one base beyond the shared edge
+    ],
+)
+def test_iter_target_candidates_overlap_guard(tmp_path, positions, overlap):
+    ds1 = _loaded_pfile(tmp_path, f"guard_{positions[-1]}", positions)
+    ds2 = _loaded_pfile(tmp_path, "guard_candidates", [0, 1000, 2000, 3000, 4000])
+    try:
+        steps = list(iter_target_candidates(ds1, ds2, [0, 1], 1.0, 0))
+        assert (steps[0][2].size > 0) is overlap
+    finally:
+        ds1.close()
+        ds2.close()

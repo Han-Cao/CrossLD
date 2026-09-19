@@ -208,3 +208,128 @@ def test_stats_defaults_and_ordering(tmp_path):
         assert list(block.sparse_sample_idxs[1]) == []
     finally:
         ds.close()
+
+
+# --------------------------------------------------------------------------- #
+# read cache
+# --------------------------------------------------------------------------- #
+
+def _assert_same_block(got, want) -> None:
+    """A cached block must be indistinguishable from a freshly read one."""
+
+    assert list(got.dense_rows) == list(want.dense_rows)
+    assert list(got.sparse_rows) == list(want.sparse_rows)
+    assert got.stats.dense_variants == want.stats.dense_variants
+    assert got.stats.sparse_variants == want.stats.sparse_variants
+    np.testing.assert_array_equal(got.dense, want.dense)
+    for got_row, want_row in zip(got.sparse_sample_idxs, want.sparse_sample_idxs):
+        np.testing.assert_array_equal(got_row, want_row)
+    for got_row, want_row in zip(got.sparse_values, want.sparse_values):
+        np.testing.assert_array_equal(got_row, want_row)
+
+
+def test_cache_disabled_never_populates(tmp_path):
+    ds = _load(tmp_path)
+    try:
+        reader = BlockReader(ds, cache_limit=0)
+        reader.read([0, 1, 2], keep_next={0, 1, 2})
+        assert reader.cache_size == 0
+        assert reader.cache_hits == 0
+        assert not reader.cached_mask([0, 1, 2]).any()
+    finally:
+        ds.close()
+
+
+def test_cache_reuse_matches_fresh_read(tmp_path):
+    ds = _load(tmp_path)
+    try:
+        reader = BlockReader(ds, cache_limit=10)
+        reader.read([0, 1, 2, 3, 4, 5], keep_next={2, 3, 4, 5})
+        assert reader.cache_size == 4
+        assert reader.cache_hits == 0
+
+        reused = reader.read([2, 3, 4, 5], keep_next=set())
+        assert reader.cache_hits == 4
+        assert reader.cache_size == 0  # consumed rows are dropped
+
+        _assert_same_block(reused, BlockReader(ds).read([2, 3, 4, 5]))
+    finally:
+        ds.close()
+
+
+def test_cache_limit_is_a_hard_cap(tmp_path):
+    ds = _load(tmp_path)
+    try:
+        reader = BlockReader(ds, cache_limit=2)
+        reader.read([0, 1, 2, 3, 4, 5], keep_next={0, 1, 2, 3, 4, 5})
+        assert reader.cache_size == 2
+        assert int(reader.cached_mask([0, 1, 2, 3, 4, 5]).sum()) == 2
+    finally:
+        ds.close()
+
+
+def test_retain_drops_unlisted_rows(tmp_path):
+    ds = _load(tmp_path)
+    try:
+        reader = BlockReader(ds, cache_limit=10)
+        reader.read([0, 1, 2, 3], keep_next={0, 1, 2, 3})
+        assert reader.cache_size == 4
+        reader.retain({1, 3})
+        assert reader.cache_size == 2
+        assert list(reader.cached_mask([0, 1, 2, 3])) == [False, True, False, True]
+    finally:
+        ds.close()
+
+
+def test_mixed_cached_and_new_rows_keep_requested_order(tmp_path):
+    ds = _load(tmp_path)
+    try:
+        reader = BlockReader(ds, cache_limit=10)
+        reader.read([0, 2], keep_next={0, 2})  # v0 dense, v2 sparse
+        block = reader.read([2, 1, 0], keep_next=set())  # sparse, new dense, dense
+        assert reader.cache_hits == 2
+        _assert_same_block(block, BlockReader(ds).read([2, 1, 0]))
+    finally:
+        ds.close()
+
+
+def test_cached_sparse_preserves_missing(tmp_path):
+    ds = _load(tmp_path)
+    try:
+        reader = BlockReader(ds, cache_limit=4)
+        reader.read([4], keep_next={4})
+        block = reader.read([4], keep_next=set())
+        assert list(block.sparse_rows) == [0]
+        assert -9 in block.sparse_values[0]
+        assert 2 in block.sparse_values[0]
+    finally:
+        ds.close()
+
+
+def test_cache_reuse_on_dosage(tmp_path):
+    ds = _load(tmp_path)
+    try:
+        reader = BlockReader(ds, dosage=True, cache_limit=10)
+        reader.read([1, 3, 5], keep_next={1, 3, 5})
+        assert reader.cache_size == 3
+        reused = reader.read([1, 3, 5], keep_next=set())
+        assert reader.cache_hits == 3
+        assert reader.arr_dtype == np.float64
+        _assert_same_block(reused, BlockReader(ds, dosage=True).read([1, 3, 5]))
+    finally:
+        ds.close()
+
+
+def test_cache_reuse_on_bfile(tmp_path):
+    prefix = make_bfile(tmp_path, "bed_cache", GENOTYPES, SAMPLE_IDS, VARIANTS)
+    ds = load_dataset(prefix, "bfile", np.array(SAMPLE_IDS))
+    try:
+        reader = BlockReader(ds, cache_limit=10)
+        reader.read([0, 2, 4], keep_next={0, 2, 4})
+        assert reader.cache_size == 3
+        reused = reader.read([0, 2, 4], keep_next=set())
+        assert reader.cache_hits == 3
+        assert reused.sparse_rows.size == 0  # bfile is always dense
+        _assert_same_block(reused, BlockReader(ds).read([0, 2, 4]))
+    finally:
+        ds.close()

@@ -63,6 +63,7 @@ crossLD --bfile1 cohort --bfile2 reference --ld-snp 20:114311:G:T --ld-window-r2
 | `--ref-based` | orient r to REF alleles instead of each variant's major allele |
 | `--r` | report signed `UNPHASED_R` plus the coding allele per side (`MAJ_A`/`MAJ_B`, or `REF_A`/`REF_B` with `--ref-based`) instead of `UNPHASED_R2` |
 | `--block-size N` | variants read per block (default `500`) |
+| `--cache-limit N` | max number of dataset-2 variant rows cached across overlapping target windows (default `1000`; `0` disables) |
 | `--out FILE` | output file (default: stdout) |
 | `--debug` / `--quiet` | DEBUG / WARNING logging (default INFO) |
 
@@ -112,6 +113,12 @@ against itself and reported with `r`/`r²` of `1`.
   demand from the `.pvar`/`.bim` reader only for the rows that are actually
   written. An `r²`-only run reports `r²` without reading any allele strings, and
   a `--r` run only pays for its output rows.
+* **Read cache**: dataset-2 genotype rows decoded for a target are kept for the
+  next target when the two LD windows overlap, so shared variants are not read
+  from the `.pgen`/`.bed` twice. `--cache-limit` bounds the number of cached
+  variant rows (approximate memory `N * samples * 8` bytes for `--dosage` and
+  `N * samples` bytes for hardcalls); `0` disables the cache. The cache changes
+  only I/O — every `--cache-limit` produces identical output.
 * **Filters**: `--extract*`/`--exclude*` apply to dataset 2 only, and the variant
   count used by `--ld-window` is measured over the surviving variants.
 * **Windows**: `--ld-window N` keeps the `N` dataset-2 variants nearest to the
@@ -139,7 +146,8 @@ Diagnostics go to **stderr**, so stdout stays a clean result stream.
   run summary.
 * `--debug` (`DEBUG`): adds detailed per-block statistics (variant counts, index
   range, read mode, dense/sparse row counts, pairs evaluated/kept/skipped,
-  elapsed time), per-target plan details and skip reasons.
+  elapsed time), per-target plan details, skip reasons, and the per-target read
+  cache line (`cache_hits`, `cache_size`).
 * `--quiet` (`WARNING`): suppresses the INFO lines.
 
 ```

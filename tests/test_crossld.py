@@ -11,12 +11,14 @@ computed by hand:
 
 from __future__ import annotations
 
+import logging
 from pathlib import Path
 
 import numpy as np
 import pytest
 
-from crossld.crossld import main as cli_main
+from crossld.blocks import BlockReader
+from crossld.crossld import _iter_target_blocks, main as cli_main
 from tests.conftest import make_bfile, make_pfile, write_bed_intervals, write_extract
 
 IDS = [f"S{i}" for i in range(6)]
@@ -480,6 +482,182 @@ def test_block_size_does_not_change_results(tiny_pair, tmp_path):
 
 
 # --------------------------------------------------------------------------- #
+# dataset-2 read cache
+# --------------------------------------------------------------------------- #
+
+CACHE_LIMITS = ("0", "1", "2", "100000")
+
+# Two dataset-1 targets 100 bp apart on chromosome 1, and six dataset-2 variants
+# around them, so both windows fully overlap (with --ld-window-kb 1).
+OVERLAP_IDS = [f"S{i}" for i in range(6)]
+OVERLAP_VARIANTS_A = [
+    ("1", "1:1000:A:G", 1000, "A", "G"),
+    ("1", "1:1100:C:T", 1100, "C", "T"),
+]
+OVERLAP_VARIANTS_B = [
+    ("1", f"1:{pos}:A:G", pos, "A", "G")
+    for pos in (500, 1000, 1050, 1100, 1200, 1600)
+]
+OVERLAP_GENOTYPES_A = np.array(
+    [[0, 0, 1, 1, 2, 2], [0, 1, 0, 2, 0, 2]], dtype=np.int8
+)
+OVERLAP_GENOTYPES_B = np.array(
+    [
+        [0, 0, 1, 1, 2, 2],
+        [0, 0, 1, 1, 2, 2],
+        [0, 1, 1, 0, 2, 2],
+        [0, 1, 0, 2, 0, 2],
+        [1, 1, 0, 0, 2, 2],
+        [0, 2, 1, 1, 0, 2],
+    ],
+    dtype=np.int8,
+)
+
+
+@pytest.fixture()
+def overlap_pair(tmp_path):
+    prefix_a = make_bfile(
+        tmp_path, "cache_a", OVERLAP_GENOTYPES_A, OVERLAP_IDS, OVERLAP_VARIANTS_A
+    )
+    prefix_b = make_bfile(
+        tmp_path, "cache_b", OVERLAP_GENOTYPES_B, OVERLAP_IDS, OVERLAP_VARIANTS_B
+    )
+    return prefix_a, prefix_b
+
+
+def _overlap_args(prefix_a, prefix_b, out_path, extra=()):
+    return [
+        "--bfile1", prefix_a,
+        "--bfile2", prefix_b,
+        "--ld-snps", "1:1000:A:G,1:1100:C:T",
+        "--ld-window-kb", "1",
+        "--ld-window-r2", "0",
+        *extra,
+        "--out", str(out_path),
+    ]
+
+
+@pytest.mark.parametrize("cache_limit", CACHE_LIMITS)
+@pytest.mark.parametrize(
+    "extra",
+    [(), ("--block-size", "1"), ("--ld-window", "2"), ("--r",)],
+    ids=["plain", "block1", "window2", "r"],
+)
+def test_cache_limit_does_not_change_results(tiny_pair, tmp_path, cache_limit, extra):
+    prefix_a, prefix_b = tiny_pair
+    out0 = tmp_path / "cache0.vcor"
+    args0 = _base_args(prefix_a, prefix_b, out0) + ["--cache-limit", "0", *extra]
+    assert cli_main(args0) == 0
+    out = tmp_path / f"cache{cache_limit}.vcor"
+    args = _base_args(prefix_a, prefix_b, out) + ["--cache-limit", cache_limit, *extra]
+    assert cli_main(args) == 0
+    assert out.read_text(encoding="utf-8") == out0.read_text(encoding="utf-8")
+
+
+@pytest.mark.parametrize("cache_limit", CACHE_LIMITS)
+@pytest.mark.parametrize("extra", [
+    ["--ld-window-kb", "10", "--ld-window", "0"],
+    ["--ld-window-kb", "10", "--ld-window", "2"],
+], ids=["kb10", "nearest2"])
+def test_cache_limit_does_not_change_results_multichrom(
+    multi_pair, tmp_path, cache_limit, extra
+):
+    prefix_a, prefix_b = multi_pair
+    out0 = tmp_path / "multi_cache0.vcor"
+    assert cli_main(
+        _multi_args(prefix_a, prefix_b, out0, extra) + ["--cache-limit", "0"]
+    ) == 0
+    out = tmp_path / f"multi_cache{cache_limit}.vcor"
+    assert cli_main(
+        _multi_args(prefix_a, prefix_b, out, extra) + ["--cache-limit", cache_limit]
+    ) == 0
+    assert out.read_text(encoding="utf-8") == out0.read_text(encoding="utf-8")
+
+
+@pytest.mark.parametrize("cache_limit", CACHE_LIMITS)
+def test_cache_limit_does_not_change_results_for_overlapping_targets(
+    overlap_pair, tmp_path, cache_limit
+):
+    prefix_a, prefix_b = overlap_pair
+    out0 = tmp_path / "overlap_cache0.vcor"
+    assert cli_main(
+        _overlap_args(prefix_a, prefix_b, out0, ["--cache-limit", "0"])
+    ) == 0
+    out = tmp_path / f"overlap_cache{cache_limit}.vcor"
+    assert cli_main(
+        _overlap_args(prefix_a, prefix_b, out, ["--cache-limit", cache_limit])
+    ) == 0
+    assert out.read_text(encoding="utf-8") == out0.read_text(encoding="utf-8")
+
+
+class _MessageCapture(logging.Handler):
+    """Collects rendered log messages for assertions."""
+
+    def __init__(self):
+        super().__init__()
+        self.messages: list[str] = []
+
+    def emit(self, record):
+        self.messages.append(record.getMessage())
+
+
+def test_cache_reuses_rows_for_overlapping_targets(overlap_pair, tmp_path, monkeypatch):
+    import crossld.crossld as crossld_module
+
+    prefix_a, prefix_b = overlap_pair
+    instances = []
+
+    class _RecordingReader(BlockReader):
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, **kwargs)
+            instances.append(self)
+
+    monkeypatch.setattr(crossld_module, "BlockReader", _RecordingReader)
+    captured = _MessageCapture()
+    logger = logging.getLogger("crossld.crossld")
+    logger.addHandler(captured)
+    try:
+        assert cli_main(
+            _overlap_args(
+                prefix_a, prefix_b, tmp_path / "hits.vcor",
+                ["--cache-limit", "3", "--debug"],
+            )
+        ) == 0
+    finally:
+        logger.removeHandler(captured)
+
+    reader2 = instances[-1]  # the dataset-2 reader is created after dataset-1
+    assert reader2.cache_limit == 3
+    assert reader2.cache_hits > 0
+    assert reader2.cache_size <= 3
+    assert any("cache_hits=" in message for message in captured.messages)
+
+
+@pytest.mark.parametrize(
+    "candidates, cached_positions, block_size, expected",
+    [
+        (np.arange(10, dtype=np.uint32), [1, 2, 3, 7], 3,
+         [[1, 2, 3], [7, 0, 4], [5, 6, 8], [9]]),
+        (np.arange(4, dtype=np.uint32), [0, 1, 2, 3], 3, [[0, 1, 2], [3]]),
+        (np.array([50, 10, 30, 20, 40], dtype=np.uint32), [0], 3,
+         [[50, 10, 20], [30, 40]]),
+        (np.empty(0, dtype=np.uint32), [], 5, []),
+    ],
+)
+def test_iter_target_blocks_cached_first_and_sized(
+    candidates, cached_positions, block_size, expected
+):
+    cached = np.zeros(candidates.size, dtype=bool)
+    cached[cached_positions] = True
+    blocks = list(_iter_target_blocks(candidates, cached, block_size))
+    assert [block.tolist() for block in blocks] == expected
+    for block in blocks:
+        assert block.size <= block_size
+    # every candidate is used exactly once
+    joined = np.concatenate(blocks) if blocks else np.empty(0, dtype=np.uint32)
+    assert sorted(joined.tolist()) == sorted(candidates.tolist())
+
+# --------------------------------------------------------------------------- #
 # error paths
 # --------------------------------------------------------------------------- #
 
@@ -495,6 +673,7 @@ def test_block_size_does_not_change_results(tiny_pair, tmp_path):
         pytest.param(lambda a: _set(a, "--ld-window-r2", "-1"), id="r2-negative"),
         pytest.param(lambda a: _set(a, "--ld-window-kb", "-1"), id="negative-kb"),
         pytest.param(lambda a: a + ["--block-size", "0"], id="zero-block-size"),
+        pytest.param(lambda a: a + ["--cache-limit", "-1"], id="negative-cache-limit"),
     ],
 )
 def test_validation_errors_exit_2(tiny_pair, tmp_path, mutate):

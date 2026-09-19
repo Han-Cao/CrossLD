@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import logging
 import os
+from collections.abc import Iterator
 from dataclasses import dataclass
 
 import numpy as np
@@ -107,6 +108,17 @@ class ChromIndex:
             cached = np.flatnonzero(self._codes == code).astype(np.uint32)
             self._index_cache[chrom] = cached
         return cached
+
+    def codes_for(self, indices: npt.NDArray[np.uint32]) -> npt.NDArray[np.uint32]:
+        """Chromosome codes for the given variant indices, in file order.
+
+        Returned codes are ints where ``names[code]`` is the chromosome label,
+        and sorting by code gives the correct chromosome order in the file.
+        """
+        idx = np.asarray(indices, dtype=np.uint32)
+        if self._codes is not None:
+            return self._codes[idx].astype(np.uint32)
+        return (np.searchsorted(self._starts, idx, side="right") - 1).astype(np.uint32)
 
 
 def _make_chrom_index(
@@ -657,7 +669,7 @@ def resolve_targets(
     snps: str | None = None,
     snp_list: str | None = None,
 ) -> list[int]:
-    """Resolve the dataset-1 target variants, warning about anything unmatched."""
+    """Resolve the sorted dataset-1 target variants, warning about anything unmatched."""
 
     ids: list[str] = []
     indices: list[int] = []
@@ -673,6 +685,9 @@ def resolve_targets(
         logger.warning("%d target LD variants not found in dataset 1", n_miss)
     if n_duphit > 0:
         logger.warning("%d target LD variants have duplicated records in dataset 1", n_duphit)
+
+    # sort by chrom code (i.e. file order) and position
+    indices = indices[np.lexsort((ds.pos[indices], ds.chrom.codes_for(indices)))]
 
     return indices.tolist()
 
@@ -722,11 +737,79 @@ def candidate_indices(
     return idx_k
 
 
+def _windows_may_overlap(
+    ds1: PlinkDataset,
+    index_a: int,
+    index_b: int,
+    window_kb: float,
+) -> bool:
+    """Whether two dataset-1 targets can share dataset-2 variants.
+
+    Two targets can only share a candidate when they are on the same
+    chromosome and their ``+/- window_kb`` windows overlap, i.e. their
+    positional distance is at most twice the window radius. The comparison is
+    closed so a variant sitting exactly on the shared window edge is not
+    missed; ``window_kb == 0`` therefore only allows equal positions.
+    """
+
+    if ds1.chrom[index_a] != ds1.chrom[index_b]:
+        return False
+    span = window_kb * 1000.0
+    return abs(int(ds1.pos[index_a]) - int(ds1.pos[index_b])) <= 2.0 * span
+
+
+def iter_target_candidates(
+    ds1: PlinkDataset,
+    ds2: PlinkDataset,
+    target_indices: list[int],
+    window_kb: float,
+    window_count: int,
+) -> Iterator[tuple[int, npt.NDArray[np.uint32], npt.NDArray[np.uint32]]]:
+    """Yield ``(target_index, candidates, keep_for_next)`` for a target run.
+
+    ``candidates`` is :func:`candidate_indices` for the current target. Windows
+    are computed one step ahead, so on the next iteration ``keep_for_next``
+    becomes the next target's ``candidates`` and every window is computed
+    exactly once.
+
+    ``keep_for_next`` equals the next target's candidate array when the two
+    windows may overlap (same chromosome and positional distance at most twice
+    the window radius, see :func:`_windows_may_overlap`); otherwise it is an
+    empty array. It exists only to drive the dataset-2 read cache: candidates
+    listed there are the only ones worth keeping for the next target.
+    """
+
+    empty = np.empty(0, dtype=np.uint32)
+    if not target_indices:
+        return
+
+    next_candidates = candidate_indices(
+        ds1, ds2, target_indices[0], window_kb, window_count
+    )
+    for position, index in enumerate(target_indices):
+        candidates = next_candidates
+        if position + 1 < len(target_indices):
+            next_index = target_indices[position + 1]
+            next_candidates = candidate_indices(
+                ds1, ds2, next_index, window_kb, window_count
+            )
+            keep = (
+                next_candidates
+                if _windows_may_overlap(ds1, index, next_index, window_kb)
+                else empty
+            )
+        else:
+            next_candidates = empty
+            keep = empty
+        yield index, candidates, keep
+
+
 __all__ = [
     "ChromIndex",
     "PlinkDataset",
     "PlinkIOError",
     "candidate_indices",
+    "iter_target_candidates",
     "load_dataset",
     "load_two_datasets",
     "parse_sample",

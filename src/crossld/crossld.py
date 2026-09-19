@@ -6,7 +6,7 @@ import argparse
 import logging
 import sys
 import time
-from collections.abc import Iterable
+from collections.abc import Iterator
 from dataclasses import dataclass, field
 
 import numpy as np
@@ -26,7 +26,7 @@ from crossld.logging_setup import LOGGER_NAME, configure_logging
 from crossld.plinkio import (
     PlinkDataset,
     PlinkIOError,
-    candidate_indices,
+    iter_target_candidates,
     load_two_datasets,
     resolve_targets,
 )
@@ -39,6 +39,7 @@ DEFAULT_LD_WINDOW = 0
 DEFAULT_LD_WINDOW_KB = 1000.0
 DEFAULT_LD_WINDOW_R2 = 0.2
 DEFAULT_BLOCK_SIZE = 500
+DEFAULT_CACHE_LIMIT = 1000
 
 class ArgumentError(Exception):
     """Command-line argument error."""
@@ -102,6 +103,9 @@ def build_parser() -> argparse.ArgumentParser:
     ld_arg.add_argument("--dosage2", action="store_true", help="use genotype dosages for dataset 2")
     ld_arg.add_argument("--block-size", type=int, default=DEFAULT_BLOCK_SIZE, metavar="N",
                         help="number of variants read per block (default: %(default)s)")
+    ld_arg.add_argument("--cache-limit", type=int, default=DEFAULT_CACHE_LIMIT, metavar="N",
+                        help="max number of dataset-2 variant rows cached across overlapping "
+                             "target windows (default: %(default)s; 0 disables)")
 
     other_arg = parser.add_argument_group("Others")
     verbosity = other_arg.add_mutually_exclusive_group()
@@ -125,6 +129,8 @@ def validate_args(args: argparse.Namespace) -> None:
         errors.append("--ld-window-r2 must be between 0 and 1")
     if args.block_size < 1:
         errors.append("--block-size must be a positive integer")
+    if args.cache_limit < 0:
+        errors.append("--cache-limit must be 0 (disabled) or a positive integer")
     if errors:
         raise ArgumentError("; ".join(errors))
 
@@ -227,12 +233,19 @@ def crossld(
     r2_threshold = args.ld_window_r2
     ref_based = args.ref_based
     reader1 = BlockReader(ds1, dosage=bool(ds1.dosage), force_dense=True)
-    reader2 = BlockReader(ds2, dosage=bool(ds2.dosage))
+    reader2 = BlockReader(
+        ds2, dosage=bool(ds2.dosage), cache_limit=args.cache_limit
+    )
     bridge = ds1.idx_bridge
 
     target_alleles: dict[int, str] = {} # index -> major/ref allele
     target_neg_signs: dict[int, int] = {} # only store -1 to reverse r
-    for order, index in enumerate(target_indices, start=1):
+    for order, (index, candidates, keep_for_next) in enumerate(
+        iter_target_candidates(
+            ds1, ds2, target_indices, args.ld_window_kb, args.ld_window
+        ),
+        start=1,
+    ):
         # target always read as dense vector
         raw = reader1.read([index]).dense[0]
 
@@ -258,17 +271,13 @@ def crossld(
             pos=int(ds1.pos[index]),
             skip_reasons={SKIP_MISSING: 0, SKIP_LOW_VARIANCE: 0},
         )
-        # select candidate variants by --ld-window*
-        candidates = candidate_indices(
-            ds1,
-            ds2,
-            index,
-            args.ld_window_kb,
-            args.ld_window,
-        )
+        # candidates were prefetched together with the target; ``keep_for_next``
+        # is the next target's window when it may overlap this one.
         progress.candidates = len(candidates)
         rows_result: list[tuple] = []
         sign_a = target_neg_signs.get(index, 1) # if not in target_neg_signs, it is 1
+        cache_hits_before = reader2.cache_hits
+        keep_next = _cache_keep(ds2, candidates, keep_for_next, args.cache_limit)
 
         # Target-level QC depends only on the target vector, so it is checked
         # once per target. A degenerate target skips every candidate pair, so the
@@ -277,20 +286,17 @@ def crossld(
         if skip_reason is not None:
             progress.skipped += len(candidates)
             progress.skip_reasons[skip_reason] += len(candidates)
-            block_total = 0
-            block_slices: Iterable[tuple[int, int]] = ()
+            blocks: list[npt.NDArray[np.uint32]] = []
         else:
             if len(candidates) == 0:
                 logger.debug("Variant %s has no dataset-2 variants within --ld-window-kb %s", 
                              ds1.ids[index], args.ld_window_kb)
-                block_total = 0
-            else:
-                block_total = max(1, -(-len(candidates) // block_size))
-            block_slices = _block_slices(len(candidates), block_size)
+            cached = reader2.cached_mask(candidates)
+            blocks = list(_iter_target_blocks(candidates, cached, block_size))
+        block_total = len(blocks)
 
-        for block_no, (start, end) in enumerate(block_slices, start=1):
-            block_var_idx = candidates[start:end]
-            block = reader2.read(block_var_idx)
+        for block_no, block_var_idx in enumerate(blocks, start=1):
+            block = reader2.read(block_var_idx, keep_next=keep_next)
             block_stats = block.stats
             block_stats.block_index = block_no
             block_stats.block_total = block_total
@@ -372,10 +378,16 @@ def crossld(
                 time.perf_counter() - start_time,
             )
 
+        # drop cached rows the next target will not reuse; this also covers a
+        # target that read no blocks (QC skip or an empty window)
+        reader2.retain(keep_next)
+
         if rows_result:
-            order_idx = np.argsort(
-                np.array([ds2.pos[x[0]] for x in rows_result], dtype=np.uint32), kind="stable"
-            )
+            pos_b = np.array([ds2.pos[x[0]] for x in rows_result], dtype=np.uint32)
+            idx_b = np.array([x[0] for x in rows_result], dtype=np.uint32)
+            # primary key is position; the dataset-2 index breaks ties so the
+            # output cannot depend on block composition (i.e. on --cache-limit)
+            order_idx = np.lexsort((idx_b, pos_b))
             for position in order_idx:
                 var_index, r_report, r2, allele_b = rows_result[position]
                 write_row(
@@ -415,15 +427,65 @@ def crossld(
                 ds1.ids[index],
                 ", ".join(f"{k}={v}" for k, v in sorted(progress.skip_reasons.items())),
             )
+        logger.debug(
+            "target %s cache_hits=%d cache_size=%d",
+            ds1.ids[index],
+            reader2.cache_hits - cache_hits_before,
+            reader2.cache_size,
+        )
     return written_total
 
 
-def _block_slices(total: int, block_size: int):
-    """Block slices generator."""
-    start = 0
-    while start < total:
-        yield start, min(start + block_size, total)
-        start += block_size
+def _cache_keep(
+    ds2: PlinkDataset,
+    candidates: npt.NDArray[np.uint32],
+    keep_for_next: npt.NDArray[np.uint32],
+    cache_limit: int,
+) -> set[int]:
+    """Variant indexes to keep cached for the next target.
+
+    The overlap of the two windows, right-trimmed to ``cache_limit`` by
+    ascending position so the rows nearest the (forward) next target survive.
+    All candidates share the target's chromosome, so position alone orders them.
+    """
+
+    if cache_limit <= 0 or candidates.size == 0 or keep_for_next.size == 0:
+        return set()
+    shared = np.intersect1d(candidates, keep_for_next, assume_unique=True)
+    if shared.size > cache_limit:
+        order = np.argsort(ds2.pos[shared], kind="stable")
+        shared = shared[order[-cache_limit:]]
+    return {int(idx) for idx in shared.tolist()}
+
+
+def _iter_target_blocks(
+    candidates: npt.NDArray[np.uint32],
+    cached_mask: npt.NDArray[np.bool_],
+    block_size: int,
+) -> Iterator[npt.NDArray[np.uint32]]:
+    """Yield blocks of at most ``block_size`` variants, cached rows first.
+
+    The cache is checked before any dataset-2 read: while the unprocessed cached
+    rows can fill a block, no read is issued. Otherwise ``min(remaining new,
+    block_size - n_cached)`` new candidates are read in ascending dataset-2
+    index order for the free slots.
+    """
+
+    cached = np.sort(candidates[cached_mask])
+    new = np.sort(candidates[~cached_mask])
+    cached_cursor = 0
+    new_cursor = 0
+    while cached_cursor < cached.size or new_cursor < new.size:
+        take_cached = min(block_size, cached.size - cached_cursor)
+        take_new = min(block_size - take_cached, new.size - new_cursor)
+        yield np.concatenate(
+            [
+                cached[cached_cursor : cached_cursor + take_cached],
+                new[new_cursor : new_cursor + take_new],
+            ]
+        )
+        cached_cursor += take_cached
+        new_cursor += take_new
 
 
 def _block_allele_info(

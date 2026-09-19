@@ -311,6 +311,33 @@ def test_r_ref_cli_output_is_byte_identical(
     )
 
 
+@pytest.mark.parametrize(
+    "truth_fixture, extra",
+    [
+        ("truth_r2_path", []),
+        ("truth_r_major_path", ["--r"]),
+        ("truth_r_ref_path", ["--r", "--ref-based"]),
+    ],
+    ids=["r2", "r_major", "r_ref"],
+)
+def test_cache_limit_preserves_acceptance_output(
+    tmp_path, sample1_prefix, sample2_prefix, request, truth_fixture, extra
+):
+    """A large read cache must not perturb any reference output."""
+
+    truth_path = request.getfixturevalue(truth_fixture)
+    out_path = tmp_path / "out_cache.vcor"
+    assert cli_main(
+        _acceptance_args(
+            sample1_prefix,
+            sample2_prefix,
+            out_path,
+            extra=[*extra, "--cache-limit", "100000"],
+        )
+    ) == 0
+    assert out_path.read_text(encoding="utf-8") == truth_path.read_text(encoding="utf-8")
+
+
 def test_r_outputs_omit_the_r2_column(tmp_path, sample1_prefix, sample2_prefix):
     """The --r layout reports the coding allele instead of UNPHASED_R2."""
 
