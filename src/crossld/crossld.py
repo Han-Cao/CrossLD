@@ -230,10 +230,9 @@ def crossld(
     reader2 = BlockReader(ds2, dosage=bool(ds2.dosage))
     bridge = ds1.idx_bridge
 
-    target_vectors: dict[int, npt.NDArray] = {}  # index -> genotype vector
     target_alleles: dict[int, str] = {} # index -> major/ref allele
     target_neg_signs: dict[int, int] = {} # only store -1 to reverse r
-    for index in target_indices:
+    for order, index in enumerate(target_indices, start=1):
         # target always read as dense vector
         raw = reader1.read([index]).dense[0]
 
@@ -249,9 +248,8 @@ def crossld(
                 target_alleles[index] = ds1.ref_allele(index)
 
         # use idx_bridge to align target vector to the dataset-2 sample order
-        target_vectors[index] = raw[bridge] if bridge is not None else raw
+        target_arr = raw[bridge] if bridge is not None else raw
 
-    for order, index in enumerate(target_indices, start=1):
         start_time = time.perf_counter()
         progress = _TargetProgress(
             index=index,
@@ -270,7 +268,6 @@ def crossld(
         )
         progress.candidates = len(candidates)
         rows_result: list[tuple] = []
-        target_arr = target_vectors[index]
         sign_a = target_neg_signs.get(index, 1) # if not in target_neg_signs, it is 1
 
         # Target-level QC depends only on the target vector, so it is checked
