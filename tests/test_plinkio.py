@@ -365,6 +365,34 @@ def test_candidate_indices_interleaved_are_ascending(tmp_path):
         ds2.close()
 
 
+def test_candidate_window_count_is_position_sorted_on_unsorted_file(tmp_path):
+    """``--ld-window N`` returns the nearest set in position order, not index order."""
+
+    prefix_a = make_pfile(
+        tmp_path, "cwp_a", _genotypes(1), SAMPLES, _chrom_variants(["1"], [32])
+    )
+    # chrom 1 file order is NOT position order: idx0=30, idx1=10, idx2=50, idx3=20
+    prefix_b = make_pfile(
+        tmp_path,
+        "cwp_b",
+        _genotypes(4),
+        SAMPLES,
+        _chrom_variants(["1", "1", "1", "1"], [30, 10, 50, 20]),
+    )
+    ds1 = load_dataset(prefix_a, "pfile", np.array(SAMPLES))
+    ds2 = load_dataset(prefix_b, "pfile", np.array(SAMPLES))
+    try:
+        ds2.sort_pos_by_chrom()
+        # nearest three to position 32 are 30, 20, 50 -> positions [20, 30, 50]
+        candidates = candidate_indices(ds1, ds2, 0, 10.0, 3)
+        positions = [int(ds2.pos[i]) for i in candidates]
+        assert positions == sorted(positions) == [20, 30, 50]
+        assert list(candidates) == [3, 0, 2]  # position order, not index order
+    finally:
+        ds1.close()
+        ds2.close()
+
+
 # --------------------------------------------------------------------------- #
 # candidate windows
 # --------------------------------------------------------------------------- #

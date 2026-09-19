@@ -17,8 +17,7 @@ from pathlib import Path
 import numpy as np
 import pytest
 
-from crossld.blocks import BlockReader
-from crossld.crossld import _iter_target_blocks, main as cli_main
+from crossld.crossld import main as cli_main
 from tests.conftest import make_bfile, make_pfile, write_bed_intervals, write_extract
 
 IDS = [f"S{i}" for i in range(6)]
@@ -601,18 +600,18 @@ class _MessageCapture(logging.Handler):
         self.messages.append(record.getMessage())
 
 
-def test_cache_reuses_rows_for_overlapping_targets(overlap_pair, tmp_path, monkeypatch):
+def test_cache_reuses_blocks_for_overlapping_targets(overlap_pair, tmp_path, monkeypatch):
     import crossld.crossld as crossld_module
 
     prefix_a, prefix_b = overlap_pair
     instances = []
 
-    class _RecordingReader(BlockReader):
+    class _RecordingCache(crossld_module.BlockCache):
         def __init__(self, *args, **kwargs):
             super().__init__(*args, **kwargs)
             instances.append(self)
 
-    monkeypatch.setattr(crossld_module, "BlockReader", _RecordingReader)
+    monkeypatch.setattr(crossld_module, "BlockCache", _RecordingCache)
     captured = _MessageCapture()
     logger = logging.getLogger("crossld.crossld")
     logger.addHandler(captured)
@@ -626,36 +625,30 @@ def test_cache_reuses_rows_for_overlapping_targets(overlap_pair, tmp_path, monke
     finally:
         logger.removeHandler(captured)
 
-    reader2 = instances[-1]  # the dataset-2 reader is created after dataset-1
-    assert reader2.cache_limit == 3
-    assert reader2.cache_hits > 0
-    assert reader2.cache_size <= 3
-    assert any("cache_hits=" in message for message in captured.messages)
+    cache = instances[-1]
+    assert cache.limit == 3
+    assert cache.reused_variants > 0
+    assert any("reused_variants=" in message for message in captured.messages)
 
 
 @pytest.mark.parametrize(
-    "candidates, cached_positions, block_size, expected",
-    [
-        (np.arange(10, dtype=np.uint32), [1, 2, 3, 7], 3,
-         [[1, 2, 3], [7, 0, 4], [5, 6, 8], [9]]),
-        (np.arange(4, dtype=np.uint32), [0, 1, 2, 3], 3, [[0, 1, 2], [3]]),
-        (np.array([50, 10, 30, 20, 40], dtype=np.uint32), [0], 3,
-         [[50, 10, 20], [30, 40]]),
-        (np.empty(0, dtype=np.uint32), [], 5, []),
-    ],
+    "min_overlap",
+    ["0", "0.25", "0.5", "0.75", "1"],
 )
-def test_iter_target_blocks_cached_first_and_sized(
-    candidates, cached_positions, block_size, expected
-):
-    cached = np.zeros(candidates.size, dtype=bool)
-    cached[cached_positions] = True
-    blocks = list(_iter_target_blocks(candidates, cached, block_size))
-    assert [block.tolist() for block in blocks] == expected
-    for block in blocks:
-        assert block.size <= block_size
-    # every candidate is used exactly once
-    joined = np.concatenate(blocks) if blocks else np.empty(0, dtype=np.uint32)
-    assert sorted(joined.tolist()) == sorted(candidates.tolist())
+def test_cache_min_overlap_does_not_change_results(overlap_pair, tmp_path, min_overlap):
+    prefix_a, prefix_b = overlap_pair
+    out0 = tmp_path / "minoverlap0.vcor"
+    assert cli_main(
+        _overlap_args(prefix_a, prefix_b, out0, ["--cache-limit", "0"])
+    ) == 0
+    out = tmp_path / f"minoverlap{min_overlap}.vcor"
+    assert cli_main(
+        _overlap_args(
+            prefix_a, prefix_b, out,
+            ["--cache-limit", "3", "--cache-min-overlap", min_overlap],
+        )
+    ) == 0
+    assert out.read_text(encoding="utf-8") == out0.read_text(encoding="utf-8")
 
 # --------------------------------------------------------------------------- #
 # error paths
@@ -674,6 +667,8 @@ def test_iter_target_blocks_cached_first_and_sized(
         pytest.param(lambda a: _set(a, "--ld-window-kb", "-1"), id="negative-kb"),
         pytest.param(lambda a: a + ["--block-size", "0"], id="zero-block-size"),
         pytest.param(lambda a: a + ["--cache-limit", "-1"], id="negative-cache-limit"),
+        pytest.param(lambda a: a + ["--cache-min-overlap", "1.5"], id="overlap-high"),
+        pytest.param(lambda a: a + ["--cache-min-overlap", "-0.1"], id="overlap-negative"),
     ],
 )
 def test_validation_errors_exit_2(tiny_pair, tmp_path, mutate):

@@ -7,7 +7,7 @@ Reads dataset variants in blocks, using sparse representations when the underlyi
 from __future__ import annotations
 
 import logging
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 
 import numpy as np
 import numpy.typing as npt
@@ -71,18 +71,188 @@ class BlockMatrix:
     stats: BlockStats
 
 
-@dataclass(slots=True)
-class _CachedRow:
-    """One cached dataset-2 variant row.
+def slice_block(block: BlockMatrix, start: int, end: int) -> BlockMatrix:
+    """Rows ``[start, end)`` of ``block`` as a **view** with fresh stats.
 
-    A row is either dense (``values`` is the 1-D genotype/dosage vector and
-    ``sample_idxs`` is ``None``) or sparse (``sample_idxs``/``values`` are the
-    listed sample indexes and values). Cached arrays are never mutated by the
-    LD code, so they are safe to share across blocks.
+    ``start``/``end`` are 0-based positions in the block's requested variant
+    list. The dense rows are a C-contiguous 2D slice (a numpy view, never a
+    copy) and the sparse per-row arrays are shared; only the tiny position
+    arrays and the :class:`BlockStats` object are new. The LD code never mutates
+    these arrays, so views are safe to share with a cached block.
     """
 
-    values: npt.NDArray
-    sample_idxs: npt.NDArray[np.uint32] | None = None
+    n_variants = int(block.stats.variants)
+    if not 0 <= start <= end <= n_variants:
+        raise ValueError(
+            f"slice [{start}, {end}) out of range for a {n_variants}-variant block"
+        )
+
+    # ``dense_rows``/``sparse_rows`` are ascending row positions, so the rows
+    # inside ``[start, end)`` are a contiguous slice of each array.
+    d0 = int(np.searchsorted(block.dense_rows, start, side="left"))
+    d1 = int(np.searchsorted(block.dense_rows, end, side="left"))
+    s0 = int(np.searchsorted(block.sparse_rows, start, side="left"))
+    s1 = int(np.searchsorted(block.sparse_rows, end, side="left"))
+
+    stats = BlockStats(
+        variants=end - start,
+        dense_variants=d1 - d0,
+        sparse_variants=s1 - s0,
+        mode=block.stats.mode,
+    )
+    return BlockMatrix(
+        dense=block.dense[d0:d1],
+        dense_rows=block.dense_rows[d0:d1] - np.uint32(start),
+        sparse_rows=block.sparse_rows[s0:s1] - np.uint32(start),
+        sparse_sample_idxs=block.sparse_sample_idxs[s0:s1],
+        sparse_values=block.sparse_values[s0:s1],
+        stats=stats,
+    )
+
+
+@dataclass(slots=True)
+class _CachedBlock:
+    """One cached target block: its request-order indexes and decoded matrix."""
+
+    indices: npt.NDArray[np.uint32]
+    block: BlockMatrix
+
+
+class BlockCache:
+    """Whole-block dataset-2 read cache across overlapping target windows.
+
+    A cache entry is a ``(variant_indices, BlockMatrix)`` pair in the dataset-2
+    position order produced by :func:`~crossld.plinkio.candidate_indices`.
+    :meth:`plan` reuses entries by intersecting them with a target's candidates
+    and returning contiguous slices (numpy views for dense rows, shared per-row
+    arrays for sparse rows); :meth:`restamp` rebuilds the cache from the blocks
+    actually used, keeping the rightmost ``limit`` whose overlap with the next
+    target's candidates is strictly greater than ``min_overlap``.
+
+    The cache never changes results: ``limit <= 0`` leaves it empty and
+    :meth:`plan` degenerates to plain ``block_size`` chunking.
+    """
+
+    def __init__(self, limit: int = 0, min_overlap: float = 0.5) -> None:
+        self.limit = int(limit)
+        self.min_overlap = float(min_overlap)
+        self._entries: list[_CachedBlock] = []
+        self.reused_variants = 0
+
+    @property
+    def size(self) -> int:
+        """Number of blocks currently cached."""
+
+        return len(self._entries)
+
+    def clear(self) -> None:
+        """Drop every cached block."""
+
+        self._entries.clear()
+
+    def plan(
+        self,
+        candidates: npt.NDArray[np.uint32],
+        block_size: int,
+    ) -> list[tuple[npt.NDArray[np.uint32], BlockMatrix | None]]:
+        """Blocks for one target, in candidate order, each ``<= block_size``.
+
+        Each cached entry is intersected with ``candidates``; with every array
+        in the fixed position order the intersection is one contiguous run,
+        emitted as a :func:`slice_block` view. Candidate rows not covered by any
+        cached run are emitted as ``(index_chunk, None)`` for the caller to read.
+        The two kinds are never merged (merging would copy). A defensive check
+        emits the block fresh when an intersection is not a single contiguous
+        run.
+        """
+
+        idx = np.asarray(candidates, dtype=np.uint32)
+        n = int(idx.size)
+        block_size = max(1, int(block_size))
+
+        run_id = np.full(n, -1, dtype=np.int64)
+        # (candidate_start, candidate_end, entry, block_start, block_end)
+        runs: list[tuple[int, int, _CachedBlock, int, int]] = []
+
+        if self.limit > 0 and n:
+            for entry in self._entries:
+                if entry.indices.size == 0:
+                    continue
+                _common, ib, ic = np.intersect1d(
+                    entry.indices, idx, assume_unique=True, return_indices=True
+                )
+                if ic.size == 0:
+                    continue
+                order = np.argsort(ic, kind="stable")
+                ic = ic[order]
+                ib = ib[order]
+                if not (np.all(np.diff(ic) == 1) and np.all(np.diff(ib) == 1)):
+                    # Defensive: not a single contiguous run -> read it fresh.
+                    continue
+                cand_start, cand_end = int(ic[0]), int(ic[-1]) + 1
+                blk_start, blk_end = int(ib[0]), int(ib[-1]) + 1
+                if np.any(run_id[cand_start:cand_end] >= 0):
+                    continue  # entries are disjoint; guard against overlap
+                run_id[cand_start:cand_end] = len(runs)
+                runs.append((cand_start, cand_end, entry, blk_start, blk_end))
+
+        out: list[tuple[npt.NDArray[np.uint32], BlockMatrix | None]] = []
+        i = 0
+        while i < n:
+            rid = int(run_id[i])
+            if rid >= 0:
+                cand_start, cand_end, entry, blk_start, blk_end = runs[rid]
+                out.append(
+                    (
+                        idx[cand_start:cand_end].copy(),
+                        slice_block(entry.block, blk_start, blk_end),
+                    )
+                )
+                self.reused_variants += cand_end - cand_start
+                i = cand_end
+            else:
+                j = i
+                while j < n and run_id[j] < 0:
+                    j += 1
+                for a in range(i, j, block_size):
+                    b = min(a + block_size, j)
+                    out.append((idx[a:b].copy(), None))
+                i = j
+
+        return out
+
+    def restamp(
+        self,
+        used: list[tuple[npt.NDArray[np.uint32], BlockMatrix]],
+        next_candidates: npt.NDArray[np.uint32],
+    ) -> None:
+        """Rebuild the cache from this target's blocks for the next target.
+
+        Keep every ``(indices, block)`` whose overlap with ``next_candidates``
+        is strictly greater than ``min_overlap`` and retain the rightmost
+        ``limit``. Blocks that are themselves views are stored as-is (cheap; the
+        numpy view keeps the base array alive).
+        """
+
+        self._entries = []
+        if self.limit <= 0:
+            return
+        nxt = np.asarray(next_candidates, dtype=np.uint32)
+        if nxt.size == 0:
+            return
+
+        selected: list[_CachedBlock] = []
+        for indices, block in used:
+            arr = np.asarray(indices, dtype=np.uint32)
+            if arr.size == 0:
+                continue
+            overlap = int(np.intersect1d(arr, nxt, assume_unique=True).size)
+            if overlap / arr.size > self.min_overlap:
+                selected.append(_CachedBlock(indices=arr.copy(), block=block))
+
+        if len(selected) > self.limit:
+            selected = selected[-self.limit:]
+        self._entries = selected
 
 
 @dataclass
@@ -96,17 +266,11 @@ class BlockReader:
     we also use np.float64 for all dosages and downstream LD calaculation.
     
     TODO: consider make --float32 as a optional flag
-
-    Rows decoded for a block can be kept for later reads through ``keep_next``
-    (see :meth:`read`), bounded by ``cache_limit`` (``0`` disables caching).
     """
 
     dataset: PlinkDataset
     dosage: bool = False
     force_dense: bool = False
-    cache_limit: int = 0
-    cache_hits: int = field(default=0, init=False)
-    _cache: dict[int, _CachedRow] = field(default_factory=dict, init=False)
 
     def __post_init__(self) -> None:
         self.reader = self.dataset.reader
@@ -122,39 +286,8 @@ class BlockReader:
 
         return self.dataset.active_sample_ct
 
-    @property
-    def cache_size(self) -> int:
-        """Number of variant rows currently cached."""
-
-        return len(self._cache)
-
-    def cached_mask(self, indices: list[int] | npt.NDArray[np.uint32]) -> npt.NDArray[np.bool_]:
-        """Boolean mask: which requested variant indexes are already cached."""
-
-        idx_array = np.asarray(indices, dtype=np.uint32)
-        cache = self._cache
-        return np.array([int(idx) in cache for idx in idx_array], dtype=bool)
-
-    def retain(self, keep) -> None:
-        """Drop every cached row whose variant index is not in ``keep``."""
-
-        keep_set = {int(idx) for idx in np.asarray(keep).tolist()}
-        for key in [key for key in self._cache if key not in keep_set]:
-            del self._cache[key]
-
-    def read(
-        self,
-        indices: list[int] | npt.NDArray[np.uint32],
-        keep_next: set[int] | None = None,
-    ) -> BlockMatrix:
-        """Read ``indices`` as one :class:`BlockMatrix` (dense and sparse rows).
-
-        Rows already in the cache are served from memory; the remaining rows go
-        through the regular pgenlib path. Passing ``keep_next`` keeps the rows
-        listed there in the cache (up to :attr:`cache_limit`) and drops the
-        consumed rows that are not listed, so the cache only ever holds rows a
-        later call can reuse.
-        """
+    def read(self, indices: list[int] | npt.NDArray[np.uint32]) -> BlockMatrix:
+        """Read ``indices`` as one :class:`BlockMatrix` (dense and sparse rows)."""
 
         idx_array = np.asarray(indices, dtype=np.uint32)
         stats = BlockStats(
@@ -164,92 +297,27 @@ class BlockReader:
         if idx_array.size == 0:
             return self._empty(stats)
 
-        cached_mask = self.cached_mask(idx_array)
-        self.cache_hits += int(cached_mask.sum())
-        new_mask = ~cached_mask
-        new_positions = np.flatnonzero(new_mask)
-
-        # classify only the rows that still have to be read (dense vs sparse)
-        new_idx = idx_array[new_positions]
-        if new_idx.size and not (self.force_dense or self.fmt == "bfile"):
-            idx_sparse = self._find_sparse(new_idx)
-        else:
+        if self.force_dense or self.fmt == "bfile":
             idx_sparse = np.empty(0, dtype=np.uint32)
-        if idx_sparse.size:
-            new_sparse_mask = np.isin(new_idx, idx_sparse)
         else:
-            new_sparse_mask = np.zeros(new_idx.size, dtype=bool)
+            idx_sparse = self._find_sparse(idx_array)
 
-        new_dense_positions = new_positions[~new_sparse_mask]
-        new_sparse_positions = new_positions[new_sparse_mask]
-
-        dense_mask = new_mask.copy()
-        dense_mask[new_sparse_positions] = False
-        sparse_mask = np.zeros(idx_array.size, dtype=bool)
-        sparse_mask[new_sparse_positions] = True
-        # cached rows take the dense/sparse kind they were stored with
-        for pos in np.flatnonzero(cached_mask).tolist():
-            if self._cache[int(idx_array[pos])].sample_idxs is None:
-                dense_mask[pos] = True
-            else:
-                sparse_mask[pos] = True
-
-        dense_rows = np.flatnonzero(dense_mask).astype(np.uint32)
+        if idx_sparse.size:
+            sparse_mask = np.isin(idx_array, idx_sparse)
+        else:
+            sparse_mask = np.zeros(idx_array.size, dtype=bool)
+        dense_rows = np.flatnonzero(~sparse_mask).astype(np.uint32)
         sparse_rows = np.flatnonzero(sparse_mask).astype(np.uint32)
 
-        if new_dense_positions.size:
-            new_dense = self._read_dense(idx_array[new_dense_positions])
-        else:
-            new_dense = np.empty((0, self.sample_ct), dtype=self.arr_dtype)
-
-        if new_sparse_positions.size:
-            new_sparse_idxs, new_sparse_values = self._read_sparse(
-                idx_array[new_sparse_positions]
-            )
-        else:
-            new_sparse_idxs, new_sparse_values = [], []
-
-        # assemble dense rows in the exact requested order
         if dense_rows.size:
-            dense = np.empty((dense_rows.size, self.sample_ct), dtype=self.arr_dtype)
-            cached_in_dense = np.flatnonzero(cached_mask[dense_rows])
-            if cached_in_dense.size:
-                dense[cached_in_dense] = np.stack(
-                    [
-                        self._cache[int(idx_array[dense_rows[pos]])].values
-                        for pos in cached_in_dense.tolist()
-                    ]
-                )
-            new_in_dense = np.flatnonzero(new_mask[dense_rows])
-            if new_in_dense.size:
-                dense[new_in_dense] = new_dense
+            dense = self._read_dense(idx_array[dense_rows])
         else:
             dense = np.empty((0, self.sample_ct), dtype=self.arr_dtype)
 
-        # assemble sparse rows in the exact requested order
-        sparse_sample_idxs: list[npt.NDArray[np.uint32]] = []
-        sparse_values: list[npt.NDArray] = []
-        new_sparse_cursor = 0
-        for pos in sparse_rows.tolist():
-            if cached_mask[pos]:
-                row = self._cache[int(idx_array[pos])]
-                sparse_sample_idxs.append(row.sample_idxs)
-                sparse_values.append(row.values)
-            else:
-                sparse_sample_idxs.append(new_sparse_idxs[new_sparse_cursor])
-                sparse_values.append(new_sparse_values[new_sparse_cursor])
-                new_sparse_cursor += 1
-
-        self._update_cache(
-            idx_array,
-            cached_mask,
-            new_dense_positions,
-            new_dense,
-            new_sparse_positions,
-            new_sparse_idxs,
-            new_sparse_values,
-            keep_next,
-        )
+        if sparse_rows.size:
+            sparse_sample_idxs, sparse_values = self._read_sparse(idx_array[sparse_rows])
+        else:
+            sparse_sample_idxs, sparse_values = [], []
 
         stats.dense_variants = int(dense_rows.size)
         stats.sparse_variants = int(sparse_rows.size)
@@ -262,50 +330,6 @@ class BlockReader:
             sparse_values=sparse_values,
             stats=stats,
         )
-
-    def _update_cache(
-        self,
-        idx_array: npt.NDArray[np.uint32],
-        cached_mask: npt.NDArray[np.bool_],
-        new_dense_positions: npt.NDArray[np.intp],
-        new_dense: npt.NDArray,
-        new_sparse_positions: npt.NDArray[np.intp],
-        new_sparse_idxs: list[npt.NDArray[np.uint32]],
-        new_sparse_values: list[npt.NDArray],
-        keep_next: set[int] | None,
-    ) -> None:
-        """Drop consumed rows not needed later, then retain newly read ones.
-
-        Dropping happens first so the freed slots are available to the rows
-        just read; the ``cache_limit`` invariant holds throughout.
-        """
-
-        keep = keep_next if keep_next is not None else set()
-
-        # 1. consumed cached rows that no later call will reuse
-        for pos in np.flatnonzero(cached_mask).tolist():
-            key = int(idx_array[pos])
-            if key not in keep:
-                del self._cache[key]
-
-        # 2. newly read rows that a later call will reuse
-        if self.cache_limit <= 0:
-            return
-        for row_pos, pos in enumerate(new_dense_positions.tolist()):
-            if len(self._cache) >= self.cache_limit:
-                return
-            key = int(idx_array[pos])
-            if key in keep:
-                self._cache[key] = _CachedRow(values=new_dense[row_pos].copy())
-        for row_pos, pos in enumerate(new_sparse_positions.tolist()):
-            if len(self._cache) >= self.cache_limit:
-                return
-            key = int(idx_array[pos])
-            if key in keep:
-                self._cache[key] = _CachedRow(
-                    values=new_sparse_values[row_pos],
-                    sample_idxs=new_sparse_idxs[row_pos],
-                )
 
     def _empty(self, stats: BlockStats) -> BlockMatrix:
         """Return an empty BlockMatrix."""
@@ -365,4 +389,4 @@ class BlockReader:
         return self.reader.has_sparse(variant_idx)
 
 
-__all__ = ["BlockMatrix", "BlockReader", "BlockStats"]
+__all__ = ["BlockCache", "BlockMatrix", "BlockReader", "BlockStats", "slice_block"]

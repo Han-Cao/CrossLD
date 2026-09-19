@@ -705,8 +705,17 @@ def candidate_indices(
     the nearest by absolute position distance (``0`` means no limit). Only
     variants surviving the dataset's variant filter are eligible (see
     :meth:`PlinkDataset.apply_variant_filter`). The returned indexes are unique
-    and ascending, which is what ``pgenlib`` prefers.
+    and in position order (the fixed order from :meth:`PlinkDataset.get_sorted_index`),
+    which is what the block cache relies on; pgenlib currently accepts such
+    (not necessarily index-ascending) input.
     """
+
+    # Important:
+    # the returned index is sorted only if dataset 2 is postion-sorted
+    # this is OK with current pgenlib but may break in the future
+    # the current implementation is important for cache input
+    # if pgenlib no longer support unsorted index to query
+    # we should disable cache and output sorted index
 
     chrom = ds1.chrom[target_index]
     pos_a = int(ds1.pos[target_index])
@@ -728,12 +737,11 @@ def candidate_indices(
         # unsigned underflow would report variants left of the target as
         # ~2**32 bp away instead of their true distance.
         distance = np.abs(pos_k.astype(np.int64) - pos_a)
-        order = np.argsort(distance, kind="stable")[:window_count]
-        # Sort the order to ensure the returned array is ascending
-        order = np.sort(order)
-        return np.unique(idx_k[order])
+        keep_idx = np.argsort(distance, kind="stable")[:window_count]
+        # sort to make sure the returned index is position-sorted
+        keep_idx.sort()
+        return idx_k[keep_idx]
 
-    # Ascending order is ensured by ``get_sorted_index``, no need to sort
     return idx_k
 
 

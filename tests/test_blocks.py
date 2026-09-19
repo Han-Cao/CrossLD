@@ -11,7 +11,7 @@ from __future__ import annotations
 import numpy as np
 import pytest
 
-from crossld.blocks import BlockReader, BlockStats
+from crossld.blocks import BlockCache, BlockReader, BlockStats, slice_block
 from crossld.plinkio import load_dataset
 from tests.conftest import make_bfile, make_dosage_pfile, make_pfile
 
@@ -211,125 +211,196 @@ def test_stats_defaults_and_ordering(tmp_path):
 
 
 # --------------------------------------------------------------------------- #
-# read cache
+# block slicing (cache views)
 # --------------------------------------------------------------------------- #
 
-def _assert_same_block(got, want) -> None:
-    """A cached block must be indistinguishable from a freshly read one."""
-
-    assert list(got.dense_rows) == list(want.dense_rows)
-    assert list(got.sparse_rows) == list(want.sparse_rows)
-    assert got.stats.dense_variants == want.stats.dense_variants
-    assert got.stats.sparse_variants == want.stats.sparse_variants
-    np.testing.assert_array_equal(got.dense, want.dense)
-    for got_row, want_row in zip(got.sparse_sample_idxs, want.sparse_sample_idxs):
-        np.testing.assert_array_equal(got_row, want_row)
-    for got_row, want_row in zip(got.sparse_values, want.sparse_values):
-        np.testing.assert_array_equal(got_row, want_row)
+def _assert_reconstruct_equal(got, want, sample_ct: int) -> None:
+    np.testing.assert_array_equal(
+        _reconstruct(got, sample_ct), _reconstruct(want, sample_ct)
+    )
 
 
-def test_cache_disabled_never_populates(tmp_path):
+def test_slice_block_dense_is_a_view_and_matches_fresh_read(tmp_path):
     ds = _load(tmp_path)
     try:
-        reader = BlockReader(ds, cache_limit=0)
-        reader.read([0, 1, 2], keep_next={0, 1, 2})
-        assert reader.cache_size == 0
-        assert reader.cache_hits == 0
-        assert not reader.cached_mask([0, 1, 2]).any()
+        reader = BlockReader(ds)
+        block = reader.read([0, 1, 2, 3, 4, 5])
+        sliced = slice_block(block, 1, 5)
+
+        assert sliced.stats.variants == 4
+        assert sliced.stats.dense_variants == 2  # variants 1, 3
+        assert sliced.stats.sparse_variants == 2  # variants 2, 4
+        assert sliced.stats is not block.stats
+        assert np.shares_memory(sliced.dense, block.dense)
+        _assert_reconstruct_equal(sliced, reader.read([1, 2, 3, 4]), ds.active_sample_ct)
     finally:
         ds.close()
 
 
-def test_cache_reuse_matches_fresh_read(tmp_path):
+def test_slice_block_sparse_rows_share_arrays(tmp_path):
     ds = _load(tmp_path)
     try:
-        reader = BlockReader(ds, cache_limit=10)
-        reader.read([0, 1, 2, 3, 4, 5], keep_next={2, 3, 4, 5})
-        assert reader.cache_size == 4
-        assert reader.cache_hits == 0
+        reader = BlockReader(ds)
+        block = reader.read([0, 2, 4])  # all sparse
+        sliced = slice_block(block, 1, 3)
 
-        reused = reader.read([2, 3, 4, 5], keep_next=set())
-        assert reader.cache_hits == 4
-        assert reader.cache_size == 0  # consumed rows are dropped
-
-        _assert_same_block(reused, BlockReader(ds).read([2, 3, 4, 5]))
+        assert list(sliced.sparse_rows) == [0, 1]
+        assert sliced.dense_rows.size == 0
+        # list slices are new lists, but the per-row arrays are shared
+        for got, orig in zip(sliced.sparse_values, block.sparse_values[1:3]):
+            assert got is orig
+        for got, orig in zip(sliced.sparse_sample_idxs, block.sparse_sample_idxs[1:3]):
+            assert got is orig
+        _assert_reconstruct_equal(sliced, reader.read([2, 4]), ds.active_sample_ct)
     finally:
         ds.close()
 
 
-def test_cache_limit_is_a_hard_cap(tmp_path):
+def test_slice_block_full_range_resets_stats_and_keeps_data(tmp_path):
     ds = _load(tmp_path)
     try:
-        reader = BlockReader(ds, cache_limit=2)
-        reader.read([0, 1, 2, 3, 4, 5], keep_next={0, 1, 2, 3, 4, 5})
-        assert reader.cache_size == 2
-        assert int(reader.cached_mask([0, 1, 2, 3, 4, 5]).sum()) == 2
+        reader = BlockReader(ds)
+        block = reader.read([0, 1, 2, 3, 4, 5])
+        block.stats.kept = 7  # simulate LD-loop mutation of the cached stats
+
+        full = slice_block(block, 0, block.stats.variants)
+        assert full.stats is not block.stats
+        assert full.stats.kept == 0
+        assert full.stats.variants == 6
+        assert full.stats.dense_variants == 3 and full.stats.sparse_variants == 3
+        assert np.shares_memory(full.dense, block.dense)
+        _assert_reconstruct_equal(full, block, ds.active_sample_ct)
     finally:
         ds.close()
 
 
-def test_retain_drops_unlisted_rows(tmp_path):
+@pytest.mark.parametrize("start, end", [(0, 7), (3, 2), (-1, 2)])
+def test_slice_block_rejects_out_of_range(tmp_path, start, end):
     ds = _load(tmp_path)
     try:
-        reader = BlockReader(ds, cache_limit=10)
-        reader.read([0, 1, 2, 3], keep_next={0, 1, 2, 3})
-        assert reader.cache_size == 4
-        reader.retain({1, 3})
-        assert reader.cache_size == 2
-        assert list(reader.cached_mask([0, 1, 2, 3])) == [False, True, False, True]
+        block = BlockReader(ds).read([0, 1, 2])
+        with pytest.raises(ValueError):
+            slice_block(block, start, end)
     finally:
         ds.close()
 
 
-def test_mixed_cached_and_new_rows_keep_requested_order(tmp_path):
+# --------------------------------------------------------------------------- #
+# block cache
+# --------------------------------------------------------------------------- #
+
+def _used_blocks(reader, blocks):
+    """Read ``blocks`` and return the ``(indices, BlockMatrix)`` pairs a target uses."""
+
+    return [(np.asarray(b, dtype=np.uint32), reader.read(b)) for b in blocks]
+
+
+def test_blockcache_disabled_is_plain_chunks():
+    cache = BlockCache(limit=0)
+    planned = cache.plan(np.arange(6, dtype=np.uint32), block_size=2)
+    assert [list(i) for i, _ in planned] == [[0, 1], [2, 3], [4, 5]]
+    assert all(b is None for _, b in planned)
+    assert cache.size == 0
+
+
+def test_blockcache_empty_cache_plans_every_row_fresh():
+    cache = BlockCache(limit=3)
+    planned = cache.plan(np.arange(5, dtype=np.uint32), block_size=2)
+    assert [list(i) for i, _ in planned] == [[0, 1], [2, 3], [4]]
+    assert all(b is None for _, b in planned)
+
+
+def test_blockcache_reuses_cached_block_as_view(tmp_path):
     ds = _load(tmp_path)
     try:
-        reader = BlockReader(ds, cache_limit=10)
-        reader.read([0, 2], keep_next={0, 2})  # v0 dense, v2 sparse
-        block = reader.read([2, 1, 0], keep_next=set())  # sparse, new dense, dense
-        assert reader.cache_hits == 2
-        _assert_same_block(block, BlockReader(ds).read([2, 1, 0]))
+        reader = BlockReader(ds)
+        cache = BlockCache(limit=2, min_overlap=0.5)
+        # [0,1,2] overlaps {2,3,4,5,6,7} by 1/3 -> dropped; [3,4,5] is full -> kept
+        cache.restamp(
+            _used_blocks(reader, [[0, 1, 2], [3, 4, 5]]),
+            np.array([2, 3, 4, 5, 6, 7], dtype=np.uint32),
+        )
+        assert cache.size == 1
+        assert list(cache._entries[0].indices) == [3, 4, 5]
+
+        planned = cache.plan(np.array([2, 3, 4, 5, 6, 7], dtype=np.uint32), block_size=3)
+        kinds = [(list(i), b is not None) for i, b in planned]
+        assert kinds == [([2], False), ([3, 4, 5], True), ([6, 7], False)]
+        assert cache.reused_variants == 3
+        assert np.shares_memory(planned[1][1].dense, cache._entries[0].block.dense)
     finally:
         ds.close()
 
 
-def test_cached_sparse_preserves_missing(tmp_path):
+def test_blockcache_plan_respects_block_size(tmp_path):
     ds = _load(tmp_path)
     try:
-        reader = BlockReader(ds, cache_limit=4)
-        reader.read([4], keep_next={4})
-        block = reader.read([4], keep_next=set())
-        assert list(block.sparse_rows) == [0]
-        assert -9 in block.sparse_values[0]
-        assert 2 in block.sparse_values[0]
+        reader = BlockReader(ds)
+        cache = BlockCache(limit=5, min_overlap=0.0)
+        cache.restamp(_used_blocks(reader, [[0, 1]]), np.arange(6, dtype=np.uint32))
+        planned = cache.plan(np.arange(6, dtype=np.uint32), block_size=2)
+        assert [list(i) for i, _ in planned] == [[0, 1], [2, 3], [4, 5]]
+        assert [b is not None for _, b in planned] == [True, False, False]
+        assert all(i.size <= 2 for i, _ in planned)
     finally:
         ds.close()
 
 
-def test_cache_reuse_on_dosage(tmp_path):
+def test_blockcache_plan_does_not_merge_views_with_fresh_rows(tmp_path):
     ds = _load(tmp_path)
     try:
-        reader = BlockReader(ds, dosage=True, cache_limit=10)
-        reader.read([1, 3, 5], keep_next={1, 3, 5})
-        assert reader.cache_size == 3
-        reused = reader.read([1, 3, 5], keep_next=set())
-        assert reader.cache_hits == 3
-        assert reader.arr_dtype == np.float64
-        _assert_same_block(reused, BlockReader(ds, dosage=True).read([1, 3, 5]))
+        reader = BlockReader(ds)
+        cache = BlockCache(limit=5, min_overlap=0.0)
+        cache.restamp(_used_blocks(reader, [[1, 2]]), np.array([1, 2], dtype=np.uint32))
+        planned = cache.plan(np.array([0, 1, 2, 3], dtype=np.uint32), block_size=4)
+        # a cached view is never merged with adjacent fresh rows, even when it fits
+        assert [list(i) for i, _ in planned] == [[0], [1, 2], [3]]
     finally:
         ds.close()
 
 
-def test_cache_reuse_on_bfile(tmp_path):
-    prefix = make_bfile(tmp_path, "bed_cache", GENOTYPES, SAMPLE_IDS, VARIANTS)
-    ds = load_dataset(prefix, "bfile", np.array(SAMPLE_IDS))
+def test_blockcache_restamp_keeps_rightmost_within_limit(tmp_path):
+    ds = _load(tmp_path)
     try:
-        reader = BlockReader(ds, cache_limit=10)
-        reader.read([0, 2, 4], keep_next={0, 2, 4})
-        assert reader.cache_size == 3
-        reused = reader.read([0, 2, 4], keep_next=set())
-        assert reader.cache_hits == 3
-        assert reused.sparse_rows.size == 0  # bfile is always dense
-        _assert_same_block(reused, BlockReader(ds).read([0, 2, 4]))
+        reader = BlockReader(ds)
+        cache = BlockCache(limit=2, min_overlap=0.0)
+        cache.restamp(
+            _used_blocks(reader, [[0, 1], [2, 3], [4, 5]]),
+            np.arange(6, dtype=np.uint32),
+        )
+        assert cache.size == 2
+        assert list(cache._entries[0].indices) == [2, 3]
+        assert list(cache._entries[1].indices) == [4, 5]
     finally:
         ds.close()
+
+
+def test_blockcache_restamp_uses_strict_overlap_fraction(tmp_path):
+    ds = _load(tmp_path)
+    try:
+        reader = BlockReader(ds)
+        cache = BlockCache(limit=5, min_overlap=0.5)
+        # overlap 2/4 == 0.5 is not > 0.5, so the block is not cached
+        cache.restamp(_used_blocks(reader, [[0, 1, 2, 3]]), np.array([0, 1], dtype=np.uint32))
+        assert cache.size == 0
+        # overlap 3/4 == 0.75 > 0.5, so it is cached
+        cache.restamp(
+            _used_blocks(reader, [[0, 1, 2, 3]]), np.array([0, 1, 2], dtype=np.uint32)
+        )
+        assert cache.size == 1
+    finally:
+        ds.close()
+
+
+def test_blockcache_restamp_empty_next_clears(tmp_path):
+    ds = _load(tmp_path)
+    try:
+        reader = BlockReader(ds)
+        cache = BlockCache(limit=5, min_overlap=0.0)
+        cache.restamp(_used_blocks(reader, [[0, 1, 2]]), np.arange(6, dtype=np.uint32))
+        assert cache.size == 1
+        cache.restamp(_used_blocks(reader, [[0, 1, 2]]), np.empty(0, dtype=np.uint32))
+        assert cache.size == 0
+    finally:
+        ds.close()
+

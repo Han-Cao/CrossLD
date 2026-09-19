@@ -62,8 +62,9 @@ crossLD --bfile1 cohort --bfile2 reference --ld-snp 20:114311:G:T --ld-window-r2
 | `--dosage` / `--dosage1` / `--dosage2` | use dosages instead of hardcalls for both / one dataset |
 | `--ref-based` | orient r to REF alleles instead of each variant's major allele |
 | `--r` | report signed `UNPHASED_R` plus the coding allele per side (`MAJ_A`/`MAJ_B`, or `REF_A`/`REF_B` with `--ref-based`) instead of `UNPHASED_R2` |
-| `--block-size N` | variants read per block (default `500`) |
-| `--cache-limit N` | max number of dataset-2 variant rows cached across overlapping target windows (default `1000`; `0` disables) |
+| `--block-size N` | variants read per block (default `200`) |
+| `--cache-limit N` | max number of dataset-2 **blocks** cached across overlapping target windows, keeping the rightmost (default `5`; `0` disables) |
+| `--cache-min-overlap F` | cache a block only when its overlap with the next target's candidates exceeds this fraction of the block (default `0.5`) |
 | `--out FILE` | output file (default: stdout) |
 | `--debug` / `--quiet` | DEBUG / WARNING logging (default INFO) |
 
@@ -113,12 +114,16 @@ against itself and reported with `r`/`r²` of `1`.
   demand from the `.pvar`/`.bim` reader only for the rows that are actually
   written. An `r²`-only run reports `r²` without reading any allele strings, and
   a `--r` run only pays for its output rows.
-* **Read cache**: dataset-2 genotype rows decoded for a target are kept for the
-  next target when the two LD windows overlap, so shared variants are not read
-  from the `.pgen`/`.bed` twice. `--cache-limit` bounds the number of cached
-  variant rows (approximate memory `N * samples * 8` bytes for `--dosage` and
-  `N * samples` bytes for hardcalls); `0` disables the cache. The cache changes
-  only I/O — every `--cache-limit` produces identical output.
+* **Read cache**: whole dataset-2 blocks decoded for a target are kept for the
+  next target when their overlap with the next window exceeds
+  `--cache-min-overlap`, so shared variants are not read from the
+  `.pgen`/`.bed` twice. A reused block is served as a view (no row copy):
+  partially overlapping blocks are sliced to the shared rows. `--cache-limit`
+  bounds the number of cached blocks, keeping the rightmost (nearest the forward
+  target); approximate memory is `--cache-limit * --block-size * samples *
+  itemsize` (8 bytes per dosage, 1 byte per hardcall), plus one block of slack.
+  `0` disables the cache. The cache changes only I/O — every `--cache-limit`
+  and `--cache-min-overlap` produces identical output.
 * **Filters**: `--extract*`/`--exclude*` apply to dataset 2 only, and the variant
   count used by `--ld-window` is measured over the surviving variants.
 * **Windows**: `--ld-window N` keeps the `N` dataset-2 variants nearest to the
@@ -147,7 +152,7 @@ Diagnostics go to **stderr**, so stdout stays a clean result stream.
 * `--debug` (`DEBUG`): adds detailed per-block statistics (variant counts, index
   range, read mode, dense/sparse row counts, pairs evaluated/kept/skipped,
   elapsed time), per-target plan details, skip reasons, and the per-target read
-  cache line (`cache_hits`, `cache_size`).
+  cache line (`reused_variants`, `cached_blocks`).
 * `--quiet` (`WARNING`): suppresses the INFO lines.
 
 ```

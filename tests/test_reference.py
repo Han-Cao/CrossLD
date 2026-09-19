@@ -320,10 +320,18 @@ def test_r_ref_cli_output_is_byte_identical(
     ],
     ids=["r2", "r_major", "r_ref"],
 )
-def test_cache_limit_preserves_acceptance_output(
-    tmp_path, sample1_prefix, sample2_prefix, request, truth_fixture, extra
+@pytest.mark.parametrize(
+    "cache_args",
+    [
+        ["--cache-limit", "5", "--cache-min-overlap", "0"],
+        ["--cache-limit", "2", "--block-size", "50"],
+    ],
+    ids=["cache5-min0", "cache2-block50"],
+)
+def test_cache_preserves_acceptance_output(
+    tmp_path, sample1_prefix, sample2_prefix, request, truth_fixture, extra, cache_args
 ):
-    """A large read cache must not perturb any reference output."""
+    """An enabled read cache must not perturb any reference output."""
 
     truth_path = request.getfixturevalue(truth_fixture)
     out_path = tmp_path / "out_cache.vcor"
@@ -332,7 +340,7 @@ def test_cache_limit_preserves_acceptance_output(
             sample1_prefix,
             sample2_prefix,
             out_path,
-            extra=[*extra, "--cache-limit", "100000"],
+            extra=[*extra, *cache_args],
         )
     ) == 0
     assert out_path.read_text(encoding="utf-8") == truth_path.read_text(encoding="utf-8")
