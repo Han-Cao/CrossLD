@@ -253,7 +253,7 @@ def _dense_pairwise_constant(
     return t_const, b_const
 
 
-def _small_sample_dense(
+def _check_sample_ct_dense(
     target: npt.NDArray[np.float64],
     block: npt.NDArray,
     target_valid: npt.NDArray[np.bool_] | None,
@@ -272,8 +272,8 @@ def _small_sample_dense(
     elif target_valid is None:
         n = block_valid.sum(axis=1)
     else:
-        # if both have missingness, the do dot product
-        n = target_valid.astype(np.uint32) @ block_valid.T.astype(np.uint32)
+        # if both have missingness, then count both valid
+        n = np.count_nonzero(block_valid & target_valid[None, :], axis=1)
     bad = n < _MIN_SAMPLES
 
     return n, bad
@@ -418,7 +418,7 @@ def centered_moment_ld_dense(
     block = np.atleast_2d(block)
     tv = _resolve_target_mask(target, target_valid, compute_mask)
     bv = _resolve_dense_block_mask(block, block_valid, compute_mask)
-    n, bad = _small_sample_dense(t, block, tv, bv)
+    n, bad = _check_sample_ct_dense(t, block, tv, bv)
     r = _centered_dense(t, block, tv, bv, n, bad)
     return np.clip(r, -1.0, 1.0), n
 
@@ -530,11 +530,11 @@ def _raw_moment_result(
 
 
 def _raw_dense_block_sums(
-    target_v: npt.NDArray[np.float64],
     block: npt.NDArray,
     weight: npt.NDArray[np.float64] | None,
+    target_v: npt.NDArray[np.float64],
 ) -> tuple[npt.NDArray[np.float64], npt.NDArray[np.float64], npt.NDArray[np.float64]]:
-    """Raw-moment sums for a target (valid samples only) X dense block.
+    """Raw-moment sums for block and target * block.
 
        Return (sum_b, sum_b2, sum_tb)
        
@@ -577,6 +577,7 @@ def _raw_dense_sums(
 
     # target_valid/weight is None -> all valid
     # weight[j] == 0 means remove block[,j] from the sum
+    # sum_t0 / sum_t20 are the target moments over every valid target sample
     if target_valid is None:
         t_values = target
         weight = None
@@ -589,77 +590,48 @@ def _raw_dense_sums(
         sum_t0 = float(t_values.sum())
         sum_t20 = float(t_values @ t_values)
 
-    # sum_t0 / sum_t20 are the target moments over every valid target sample
     # ban_sum / bad_sum2 for block's missing samples to be removed later
+    # sum_t = sum_t0 - bad_sum, sum_t2 = sum_t20 - bad_sum2
     sum_t = np.full(n_rows, sum_t0, dtype=np.float64)
     sum_t2 = np.full(n_rows, sum_t20, dtype=np.float64)
     bad_sum = np.zeros(n_rows, dtype=np.float64)
     bad_sum2 = np.zeros(n_rows, dtype=np.float64)
 
     if block_valid is None:
-        if weight is None:
-            sum_b = block.sum(axis=1, dtype=np.float64)
-            sum_b2 = np.einsum("ij,ij->i", block, block, dtype=np.float64)
-        else:
-            sum_b = np.einsum("ij,j->i", block, weight, dtype=np.float64)
-            sum_b2 = np.einsum("ij,ij,j->i", block, block, weight, dtype=np.float64)
-        sum_tb = np.einsum("ij,j->i", block, t_values, dtype=np.float64)
+        # no missing in both target and block
+        sum_b, sum_b2, sum_tb = _raw_dense_block_sums(block, weight, t_values)
     else:
-        # Missing cells inside the target's valid region leave the pair. Cells
-        # outside it are irrelevant (weight 0), so the "complete" rows can be
-        # summed directly while incomplete rows are zeroed first.
+        # inv_rows/inv_cols are x/y index for each invalid value in block
+        # if target also have invalid, need to check target_valid[inv_cols]
+        # to get the union of either invalid
         inv_rows, inv_cols = np.nonzero(~block_valid)
         if target_valid is not None and inv_rows.size:
             inside = target_valid[inv_cols]
             inv_rows = inv_rows[inside]
             inv_cols = inv_cols[inside]
 
-        if inv_rows.size:
-            complete = np.bincount(inv_rows, minlength=n_rows) == 0
+        # find complete rows for fast path
+        # here complete means block_valid[:,target_valid] are all valid
+        if target_valid is None:
+            complete = n == target.size
         else:
-            complete = np.ones(n_rows, dtype=bool)
+            complete = n == target_valid.sum()
 
+        # calculate raw moment for block and target * block
         sum_b = np.zeros(n_rows, dtype=np.float64)
         sum_b2 = np.zeros(n_rows, dtype=np.float64)
         sum_tb = np.zeros(n_rows, dtype=np.float64)
 
         if complete.any():
             subset = block[complete]
-            if weight is None:
-                sum_b[complete] = subset.sum(axis=1, dtype=np.float64)
-                sum_b2[complete] = np.einsum(
-                    "ij,ij->i", subset, subset, dtype=np.float64
-                )
-            else:
-                sum_b[complete] = np.einsum(
-                    "ij,j->i", subset, weight, dtype=np.float64
-                )
-                sum_b2[complete] = np.einsum(
-                    "ij,ij,j->i", subset, subset, weight, dtype=np.float64
-                )
-            sum_tb[complete] = np.einsum(
-                "ij,j->i", subset, t_values, dtype=np.float64
-            )
+            sum_b[complete], sum_b2[complete], sum_tb[complete] = _raw_dense_block_sums(subset, weight, t_values)
 
         incomplete = ~complete
         if incomplete.any():
             subset = block[incomplete]
+            # sum invalid values as 0, not affecting the result
             zeroed = np.where(subset >= 0, subset, 0.0)
-            if weight is None:
-                sum_b[incomplete] = zeroed.sum(axis=1, dtype=np.float64)
-                sum_b2[incomplete] = np.einsum(
-                    "ij,ij->i", zeroed, zeroed, dtype=np.float64
-                )
-            else:
-                sum_b[incomplete] = np.einsum(
-                    "ij,j->i", zeroed, weight, dtype=np.float64
-                )
-                sum_b2[incomplete] = np.einsum(
-                    "ij,ij,j->i", zeroed, zeroed, weight, dtype=np.float64
-                )
-            sum_tb[incomplete] = np.einsum(
-                "ij,j->i", zeroed, t_values, dtype=np.float64
-            )
+            sum_b[incomplete], sum_b2[incomplete], sum_tb[incomplete] = _raw_dense_block_sums(zeroed, weight, t_values)
             dropped_t = target[inv_cols]
             bad_sum = np.bincount(inv_rows, weights=dropped_t, minlength=n_rows)
             bad_sum2 = np.bincount(
@@ -693,7 +665,7 @@ def raw_moment_ld_dense(
     block = np.atleast_2d(block)
     tv = _resolve_target_mask(target, target_valid, compute_mask)
     bv = _resolve_dense_block_mask(block, block_valid, compute_mask)
-    n, bad = _small_sample_dense(t, block, tv, bv)
+    n, bad = _check_sample_ct_dense(t, block, tv, bv)
     r, _ = _raw_dense_sums(t, block, tv, bv, n, bad)
     return np.clip(r, -1.0, 1.0), n
 
@@ -826,7 +798,7 @@ def _ld_dense(
     """
 
     n_rows = int(block.shape[0])
-    n, bad = _small_sample_dense(target, block, target_valid, block_valid)
+    n, bad = _check_sample_ct_dense(target, block, target_valid, block_valid)
     if force_centered:
         r = _centered_dense(target, block, target_valid, block_valid, n, bad)
         return np.clip(r, -1.0, 1.0), n, n_rows
@@ -1019,8 +991,8 @@ def pearson_pairwise_block(
 
 
 __all__ = [
-    "SKIP_MISSING",
     "SKIP_LOW_VARIANCE",
+    "SKIP_MISSING",
     "alt_freq",
     "alt_freq_sparse",
     "centered_moment_ld_dense",
