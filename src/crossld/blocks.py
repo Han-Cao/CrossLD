@@ -42,10 +42,12 @@ class BlockStats:
     incomplete_pair: int = 0
     raw_moment_pair: int = 0
     centered_moment_pair: int = 0
-    pairs_evaluated: int = 0
+    # pairs_evaluated: int = 0
     kept: int = 0
     below_r2: int = 0
-    skipped: int = 0
+    # skipped: int = 0
+    skip_missing: int = 0
+    skip_low_variance: int = 0
     mode: str = "hardcall"
 
 
@@ -160,6 +162,7 @@ class BlockReader:
     def _read_dense(self, idx_array: npt.NDArray[np.uint32]) -> npt.NDArray:
         """Read a dense genotype/dosage matrix (one row per variant)."""
 
+        # this will be overwritten, safe for np.empty
         out = np.empty((idx_array.size, self.sample_ct), dtype=self.arr_dtype)
         if self.dosage:
             self.reader.read_dosages_list(idx_array, out)

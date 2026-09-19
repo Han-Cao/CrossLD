@@ -42,7 +42,7 @@ from crossld.blocks import BlockMatrix
 
 # Pair-level skip reasons, reported through logging.
 SKIP_MISSING = "n<3"
-SKIP_ZERO_VARIANCE = "zero_variance"
+SKIP_LOW_VARIANCE = "low_variance"
 
 _MIN_SAMPLES = 3
 
@@ -216,9 +216,12 @@ def _dense_pairwise_constant(
     target: npt.NDArray[np.float64],
     block: npt.NDArray,
     target_valid: npt.NDArray[np.bool_] | None,
-    block_valid: npt.NDArray[np.bool_] | None,
+    both_valid: npt.NDArray[np.bool_] | None,
 ) -> tuple[npt.NDArray[np.bool_], npt.NDArray[np.bool_]]:
-    """Per-row constancy of target and block over the pairwise-valid samples."""
+    """Per-row constancy of target and block over the pairwise-valid samples.
+    
+       Return (per-row target constancy, per-row block constancy).
+    """
 
     n_rows = block.shape[0]
     t_const = np.zeros(n_rows, dtype=bool)
@@ -228,58 +231,51 @@ def _dense_pairwise_constant(
         t_values = target
     else:
         t_values = target[target_valid]
-    t_global = bool(t_values.size == 0 or t_values.min() == t_values.max())
+    # if target is const regardless block missingness
+    t_global_const = bool(t_values.size == 0 or t_values.min() == t_values.max())
 
-    if block_valid is None:
-        valid = None if target_valid is None else target_valid[None, :]
-    else:
-        valid = block_valid
-        if target_valid is not None:
-            valid = valid & target_valid[None, :]
-
-    if valid is None:
+    if both_valid is None:
         # No missing anywhere, so the target's constancy is already global.
-        t_const[:] = t_global
+        t_const[:] = t_global_const
         b_const[:] = block.min(axis=1) == block.max(axis=1)
         return t_const, b_const
 
-    if t_global:
+    if t_global_const:
         t_const[:] = True
     else:
-        low = np.where(valid, target[None, :], np.inf).min(axis=1)
-        high = np.where(valid, target[None, :], -np.inf).max(axis=1)
-        t_const[:] = low == high
+        t_mins = np.where(both_valid, target[None, :], np.inf).min(axis=1)
+        t_maxs = np.where(both_valid, target[None, :], -np.inf).max(axis=1)
+        t_const[:] = t_mins == t_maxs
 
-    low = np.where(valid, block, np.inf).min(axis=1)
-    high = np.where(valid, block, -np.inf).max(axis=1)
-    b_const[:] = low == high
+    b_mins = np.where(both_valid, block, np.inf).min(axis=1)
+    b_maxs = np.where(both_valid, block, -np.inf).max(axis=1)
+    b_const[:] = b_mins == b_maxs
     return t_const, b_const
 
 
-def _sanity_dense(
+def _small_sample_dense(
     target: npt.NDArray[np.float64],
     block: npt.NDArray,
     target_valid: npt.NDArray[np.bool_] | None,
     block_valid: npt.NDArray[np.bool_] | None,
 ) -> tuple[npt.NDArray[np.uint32], npt.NDArray[np.bool_]]:
-    """Pairwise sample count and per-row ``NaN`` decision for a dense block."""
+    """Pairwise sample count and per-row ``NaN`` decision for a dense block.
+       
+       Return (per-row non-missing sample count, per-row < _MIN_SAMPLES).
+    """
 
-    n_rows, sample_ct = block.shape
-    n_keep = int(target.size) if target_valid is None else int(target_valid.sum())
+    n_rows = block.shape[0]
+    n_keep = int(target_valid.sum() if target_valid is not None else target.size)
 
-    if block_valid is None or n_rows == 0:
+    if block_valid is None:
         n = np.full(n_rows, n_keep, dtype=np.uint32)
+    elif target_valid is None:
+        n = block_valid.sum(axis=1)
     else:
-        inv_rows, inv_cols = np.nonzero(~block_valid)
-        if target_valid is not None and inv_rows.size:
-            inv_rows = inv_rows[target_valid[inv_cols]]
-        if inv_rows.size:
-            n = (n_keep - np.bincount(inv_rows, minlength=n_rows)).astype(np.uint32)
-        else:
-            n = np.full(n_rows, n_keep, dtype=np.uint32)
+        # if both have missingness, the do dot product
+        n = target_valid.astype(np.uint32) @ block_valid.T.astype(np.uint32)
+    bad = n < _MIN_SAMPLES
 
-    t_const, b_const = _dense_pairwise_constant(target, block, target_valid, block_valid)
-    bad = (n < _MIN_SAMPLES) | t_const | b_const
     return n, bad
 
 
@@ -295,12 +291,13 @@ def _sanity_sparse(
     n_rows = len(sample_idxs)
     if target_valid is None:
         n_keep = int(target.size)
-        t_global = bool(target.size == 0 or target.min() == target.max())
+        t_global_const = bool(target.size == 0 or target.min() == target.max())
     else:
         n_keep = int(target_valid.sum())
         t_seen = target[target_valid]
-        t_global = bool(t_seen.size == 0 or t_seen.min() == t_seen.max())
+        t_global_const = bool(t_seen.size == 0 or t_seen.min() == t_seen.max())
 
+    # np.empty is safe here since every row are processed in loop without continue
     n_out = np.empty(n_rows, dtype=np.uint32)
     t_const = np.empty(n_rows, dtype=bool)
     b_const = np.empty(n_rows, dtype=bool)
@@ -333,8 +330,8 @@ def _sanity_sparse(
         else:
             b_const[row] = bool(listed_valid.min() == listed_valid.max())
 
-        if t_global or dropped == 0:
-            t_const[row] = t_global
+        if t_global_const or dropped == 0:
+            t_const[row] = t_global_const
         else:
             observed = (
                 np.ones(target.size, dtype=bool)
@@ -374,6 +371,8 @@ def _centered_dense(
         if target_valid is not None:
             valid = valid & target_valid[None, :]
 
+    t_const, b_const = _dense_pairwise_constant(target, block, target_valid, valid)
+
     count = n.astype(np.float64)
     if valid is None:
         a = np.broadcast_to(target[None, :], block.shape)
@@ -396,7 +395,7 @@ def _centered_dense(
         # can underflow even when the correlation is fine.
         r = (da * db).sum(axis=1) / (np.sqrt(var_a) * np.sqrt(var_b))
 
-    good = ~bad & (var_a > 0.0) & (var_b > 0.0) & np.isfinite(r)
+    good = ~(bad | t_const | b_const | ~np.isfinite(r))
     return np.where(good, r, np.nan)
 
 
@@ -419,7 +418,7 @@ def centered_moment_ld_dense(
     block = np.atleast_2d(block)
     tv = _resolve_target_mask(target, target_valid, compute_mask)
     bv = _resolve_dense_block_mask(block, block_valid, compute_mask)
-    n, bad = _sanity_dense(t, block, tv, bv)
+    n, bad = _small_sample_dense(t, block, tv, bv)
     r = _centered_dense(t, block, tv, bv, n, bad)
     return np.clip(r, -1.0, 1.0), n
 
@@ -530,6 +529,32 @@ def _raw_moment_result(
     return r, retry
 
 
+def _raw_dense_block_sums(
+    target_v: npt.NDArray[np.float64],
+    block: npt.NDArray,
+    weight: npt.NDArray[np.float64] | None,
+) -> tuple[npt.NDArray[np.float64], npt.NDArray[np.float64], npt.NDArray[np.float64]]:
+    """Raw-moment sums for a target (valid samples only) X dense block.
+
+       Return (sum_b, sum_b2, sum_tb)
+       
+       target_v = target[target_valid]
+       Weight = np.asarray(target_valid, dtype=np.float64), this is used
+       to filter block columns to match the target's valid samples.
+       Weight is None means all samples in origain target are valid.
+    """
+
+    if weight is None:
+        sum_b = block.sum(axis=1, dtype=np.float64)
+        sum_b2 = np.einsum("ij,ij->i", block, block, dtype=np.float64)
+    else:
+        sum_b = np.einsum("ij,j->i", block, weight, dtype=np.float64)
+        sum_b2 = np.einsum("ij,ij,j->i", block, block, weight, dtype=np.float64)
+    sum_tb = np.einsum("ij,j->i", block, target_v, dtype=np.float64)
+
+    return sum_b, sum_b2, sum_tb
+
+
 def _raw_dense_sums(
     target: npt.NDArray[np.float64],
     block: npt.NDArray,
@@ -545,24 +570,27 @@ def _raw_dense_sums(
     ``NaN``.
     """
 
-    n_rows, sample_ct = block.shape
+    n_rows = block.shape[0]
     r = np.full(n_rows, np.nan, dtype=np.float64)
     if n_rows == 0:
         return r, np.zeros(0, dtype=bool)
 
+    # target_valid/weight is None -> all valid
+    # weight[j] == 0 means remove block[,j] from the sum
     if target_valid is None:
-        n_keep = int(target.size)
-        weighted = target
+        t_values = target
         weight = None
         sum_t0 = float(target.sum())
         sum_t20 = float(target @ target)
     else:
-        n_keep = int(target_valid.sum())
-        weighted = np.where(target_valid, target, 0.0)
+        t_values = np.where(target_valid, target, 0.0)
+        # convert to float to calculate r
         weight = target_valid.astype(np.float64)
-        sum_t0 = float(weighted.sum())
-        sum_t20 = float(weighted @ weighted)
+        sum_t0 = float(t_values.sum())
+        sum_t20 = float(t_values @ t_values)
 
+    # sum_t0 / sum_t20 are the target moments over every valid target sample
+    # ban_sum / bad_sum2 for block's missing samples to be removed later
     sum_t = np.full(n_rows, sum_t0, dtype=np.float64)
     sum_t2 = np.full(n_rows, sum_t20, dtype=np.float64)
     bad_sum = np.zeros(n_rows, dtype=np.float64)
@@ -575,7 +603,7 @@ def _raw_dense_sums(
         else:
             sum_b = np.einsum("ij,j->i", block, weight, dtype=np.float64)
             sum_b2 = np.einsum("ij,ij,j->i", block, block, weight, dtype=np.float64)
-        sum_tb = np.einsum("ij,j->i", block, weighted, dtype=np.float64)
+        sum_tb = np.einsum("ij,j->i", block, t_values, dtype=np.float64)
     else:
         # Missing cells inside the target's valid region leave the pair. Cells
         # outside it are irrelevant (weight 0), so the "complete" rows can be
@@ -610,7 +638,7 @@ def _raw_dense_sums(
                     "ij,ij,j->i", subset, subset, weight, dtype=np.float64
                 )
             sum_tb[complete] = np.einsum(
-                "ij,j->i", subset, weighted, dtype=np.float64
+                "ij,j->i", subset, t_values, dtype=np.float64
             )
 
         incomplete = ~complete
@@ -630,7 +658,7 @@ def _raw_dense_sums(
                     "ij,ij,j->i", zeroed, zeroed, weight, dtype=np.float64
                 )
             sum_tb[incomplete] = np.einsum(
-                "ij,j->i", zeroed, weighted, dtype=np.float64
+                "ij,j->i", zeroed, t_values, dtype=np.float64
             )
             dropped_t = target[inv_cols]
             bad_sum = np.bincount(inv_rows, weights=dropped_t, minlength=n_rows)
@@ -665,7 +693,7 @@ def raw_moment_ld_dense(
     block = np.atleast_2d(block)
     tv = _resolve_target_mask(target, target_valid, compute_mask)
     bv = _resolve_dense_block_mask(block, block_valid, compute_mask)
-    n, bad = _sanity_dense(t, block, tv, bv)
+    n, bad = _small_sample_dense(t, block, tv, bv)
     r, _ = _raw_dense_sums(t, block, tv, bv, n, bad)
     return np.clip(r, -1.0, 1.0), n
 
@@ -798,7 +826,7 @@ def _ld_dense(
     """
 
     n_rows = int(block.shape[0])
-    n, bad = _sanity_dense(target, block, target_valid, block_valid)
+    n, bad = _small_sample_dense(target, block, target_valid, block_valid)
     if force_centered:
         r = _centered_dense(target, block, target_valid, block_valid, n, bad)
         return np.clip(r, -1.0, 1.0), n, n_rows
@@ -926,6 +954,12 @@ def pearson_pairwise_block(
     target_checked = target >= 0
     target_valid = None if bool(target_checked.all()) else target_checked
 
+    # check if target_valid < _MIN_SAMPLES
+    n_keep = int(target_checked.sum())
+    if n_keep < _MIN_SAMPLES:
+        block.stats.skip_missing += n_rows
+        return r, np.full(n_rows, n_keep, dtype=np.uint32)
+
     complete_pair = 0
     incomplete_pair = 0
     raw_moment_pair = 0
@@ -936,14 +970,17 @@ def pearson_pairwise_block(
         rows = block.dense_rows
         block_checked = dense >= 0
         block_valid = None if bool(block_checked.all()) else block_checked
-        complete = _dense_complete_rows(dense, block_valid, target_valid)
-        row_count = int(dense.shape[0])
-        complete_count = int(complete.sum())
-        complete_pair += complete_count
-        incomplete_pair += row_count - complete_count
         r[rows], n[rows], centered = _ld_dense(
             target.astype(np.float64), dense, target_valid, block_valid, force_centered
         )
+        # LD pair summary
+        row_count = len(rows)
+        n_miss = n_keep - n[rows]
+        assert np.all(n_miss >= 0)
+        complete = n_miss == 0
+        complete_count = int(complete.sum())
+        complete_pair += complete_count
+        incomplete_pair += row_count - complete_count
         centered_moment_pair += centered
         raw_moment_pair += row_count - centered
 
@@ -970,16 +1007,20 @@ def pearson_pairwise_block(
         centered_moment_pair += centered
         raw_moment_pair += row_count - centered
 
+    missing_pair = int(np.sum(n < _MIN_SAMPLES))
+    low_variance_pair = int(np.sum(np.isnan(r))) - missing_pair
     block.stats.complete_pair += complete_pair
     block.stats.incomplete_pair += incomplete_pair
     block.stats.raw_moment_pair += raw_moment_pair
     block.stats.centered_moment_pair += centered_moment_pair
+    block.stats.skip_missing += missing_pair
+    block.stats.skip_low_variance += low_variance_pair
     return r, n
 
 
 __all__ = [
     "SKIP_MISSING",
-    "SKIP_ZERO_VARIANCE",
+    "SKIP_LOW_VARIANCE",
     "alt_freq",
     "alt_freq_sparse",
     "centered_moment_ld_dense",

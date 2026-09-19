@@ -13,3 +13,5 @@ venv/
 references/
 tmp/
 plans/
+# benchmark: track the scripts, ignore the (large) inputs and generated results
+benchmark/analysis/

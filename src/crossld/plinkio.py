@@ -561,7 +561,7 @@ def load_dataset(
     chrom_names: list[str] = []           # unique chr labels in file order
     byte_to_code: dict[bytes, int] = {}   # unique chr bytes to chr code
     chr_runs: list[int] = []              # list of chr start indecies
-    chr_code_arr = np.empty(variant_ct, dtype=np.uint32)  # per-variant chr code
+    chr_code_arr = np.empty(variant_ct, dtype=np.uint32)  # per-variant chr code, every element will be reset
     pos: list[int] = []
     ids: list[str] = []
     last_code = -1

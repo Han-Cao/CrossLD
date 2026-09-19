@@ -14,8 +14,8 @@ import numpy.typing as npt
 from crossld import __version__
 from crossld.blocks import BlockReader
 from crossld.ld import (
+    SKIP_LOW_VARIANCE,
     SKIP_MISSING,
-    SKIP_ZERO_VARIANCE,
     major_allele_flipped,
     major_allele_flipped_sparse,
     pearson_pairwise_block,
@@ -213,14 +213,14 @@ def crossld(
     args: argparse.Namespace,
     ds1: PlinkDataset,
     ds2: PlinkDataset,
-    targets: list[int],
-    out,
+    target_indices: list[int],
+    f_out,
     allele_label: str = "MAJ",
 ) -> int:
     """Main crossld loop."""
 
     block_size = args.block_size
-    total = len(targets)
+    total = len(target_indices)
     written_total = 0
     r2_threshold = args.ld_window_r2
     ref_based = args.ref_based
@@ -228,31 +228,37 @@ def crossld(
     reader2 = BlockReader(ds2, dosage=bool(ds2.dosage))
     bridge = ds1.idx_bridge
 
-    # Orient each dataset-1 target once. The coding allele/sign are only needed
-    # for --r, so they are skipped entirely when REF/ALT were not loaded.
-    target_vectors: dict[int, npt.NDArray] = {}
-    target_alleles: dict[int, str] = {}
-    target_signs: dict[int, int] = {} # only store -1
-    for index in targets:
+    target_vectors: dict[int, npt.NDArray] = {}  # index -> genotype vector
+    target_alleles: dict[int, str] = {} # index -> major/ref allele
+    target_neg_signs: dict[int, int] = {} # only store -1 to reverse r
+    for index in target_indices:
+        # target always read as dense vector
         raw = reader1.read([index]).dense[0]
+
+        # The coding allele/sign are only needed for --r, 
+        # so they are skipped entirely when REF/ALT were not loaded.
         if args.with_r:
             if ref_based:
                 target_alleles[index] = ds1.ref_allele(index)
             elif major_allele_flipped(raw):
                 target_alleles[index] = ds1.alt_allele(index)
-                target_signs[index] = -1
+                target_neg_signs[index] = -1
             else:
                 target_alleles[index] = ds1.ref_allele(index)
+
+        # use idx_bridge to align target vector to the dataset-2 sample order
         target_vectors[index] = raw[bridge] if bridge is not None else raw
 
-    for order, index in enumerate(targets, start=1):
+    for order, index in enumerate(target_indices, start=1):
         start_time = time.perf_counter()
         progress = _TargetProgress(
             index=index,
             variant_id=ds1.ids[index],
             chrom=ds1.chrom[index],
             pos=int(ds1.pos[index]),
+            skip_reasons={SKIP_MISSING: 0, SKIP_LOW_VARIANCE: 0},
         )
+        # select candidate variants by --ld-window*
         candidates = candidate_indices(
             ds1,
             ds2,
@@ -261,9 +267,9 @@ def crossld(
             args.ld_window,
         )
         progress.candidates = len(candidates)
-        rows: list[tuple] = []
+        rows_result: list[tuple] = []
         target_arr = target_vectors[index]
-        sign_a = target_signs.get(index, 1)
+        sign_a = target_neg_signs.get(index, 1) # if not in target_neg_signs, it is 1
 
         if len(candidates) == 0:
             logger.debug("Variant %s has no dataset-2 variants within --ld-window-kb %s", 
@@ -288,37 +294,55 @@ def crossld(
                 else:
                     r_values_report = r_values * sign_a * signs_b
             else:
-                signs_b, alleles_b = None, [""] * len(block_var_idx)
+                # these will never be used, just need the shape
+                alleles_b = np.empty(len(block_var_idx), dtype=bool)
+                r_values_report = np.empty(len(block_var_idx), dtype=bool)
 
-            for row_offset, var_index in enumerate(block_var_idx):
-                r = float(r_values[row_offset])
-                r_report = float(r_values_report[row_offset]) if args.with_r else None
-                r2 = float(r2_values[row_offset])
-                if not np.isfinite(r):
-                    reason = SKIP_MISSING if int(n_values[row_offset]) < 3 else SKIP_ZERO_VARIANCE
-                    progress.skipped += 1
-                    block_stats.skipped += 1
-                    progress.skip_reasons[reason] = progress.skip_reasons.get(reason, 0) + 1
-                    continue
+            # select LD pairs > --ld-window-r2 for output
+            keep_rows = r2_values >= r2_threshold if r2_threshold > 0 else ~np.isnan(r2_values)
+            if keep_rows.all():
+                n_kept = len(block_var_idx)
+                n_below_r2 = 0
+                result_block_var_idx = block_var_idx
+                result_r_report = r_values_report
+                result_r2 = r2_values
+                result_alleles_b = alleles_b
+            else:
+                n_kept = int(keep_rows.sum())
+                n_below_r2 = int(np.sum(r2_values < r2_threshold)) # np.nan -> 0
+                result_block_var_idx = block_var_idx[keep_rows]
+                result_r_report = r_values_report[keep_rows]
+                result_r2 = r2_values[keep_rows]
+                result_alleles_b = alleles_b[keep_rows]
 
-                # 0 doubles as "no filter"; any non-zero threshold keeps pairs
-                # whose r^2 is at least that large.
-                if r2_threshold == 0.0 or r2 >= r2_threshold:
-                    rows.append((var_index, r_report, r2, alleles_b[row_offset]))
-                    progress.kept += 1
-                    block_stats.kept += 1
-                else:
-                    progress.below_r2 += 1
-                    block_stats.below_r2 += 1
-                block_stats.pairs_evaluated += 1
+            # prepare output
+            # tuple of (block_var_index, r, r2, block_var allele)
+            # for r2, r and allele is None
+            rows_result.extend(zip(
+                result_block_var_idx.tolist(),
+                result_r_report.tolist(),
+                result_r2.tolist(),
+                result_alleles_b.tolist()
+            ))
+
+            # count summary
+            progress.kept += n_kept
+            progress.below_r2 += n_below_r2
+            progress.skipped += block.stats.skip_missing + block.stats.skip_low_variance
+            progress.skip_reasons[SKIP_MISSING] += block.stats.skip_missing
+            progress.skip_reasons[SKIP_LOW_VARIANCE] += block.stats.skip_low_variance
             progress.blocks += 1
+
+            block.stats.kept += n_kept
+            block.stats.below_r2 += n_below_r2
+
             logger.debug(
                 "block %d/%d variants=%d rows=%d-%d mode=%s "
                 "dense_variants=%d sparse_variants=%d "
                 "complete_pair=%d incomplete_pair=%d "
                 "raw_moment_pair=%d centered_moment_pair=%d "
-                "pairs_evaluated=%d "
-                "pairs_kept=%d pairs_below_r2=%d pairs_skipped=%d elapsed=%.3fs",
+                "pairs_kept=%d pairs_below_r2=%d"
+                "skip_missing=%d skip_low_variance=%d elapsed=%.3fs",
                 block_stats.block_index,
                 max(block_stats.block_total, 1),
                 block_stats.variants,
@@ -331,21 +355,21 @@ def crossld(
                 block_stats.incomplete_pair,
                 block_stats.raw_moment_pair,
                 block_stats.centered_moment_pair,
-                block_stats.pairs_evaluated,
                 block_stats.kept,
                 block_stats.below_r2,
-                block_stats.skipped,
+                block_stats.skip_missing,
+                block_stats.skip_low_variance,
                 time.perf_counter() - start_time,
             )
 
-        if rows:
+        if rows_result:
             order_idx = np.argsort(
-                np.array([ds2.pos[x[0]] for x in rows], dtype=np.uint32), kind="stable"
+                np.array([ds2.pos[x[0]] for x in rows_result], dtype=np.uint32), kind="stable"
             )
             for position in order_idx:
-                var_index, r_report, r2, allele_b = rows[position]
+                var_index, r_report, r2, allele_b = rows_result[position]
                 write_row(
-                    out,
+                    f_out,
                     with_r=args.with_r,
                     chrom_a=ds1.chrom[index],
                     pos_a=int(ds1.pos[index]),
@@ -358,7 +382,7 @@ def crossld(
                     allele_a=target_alleles.get(index, ""),
                     allele_b=allele_b,
                 )
-            written_total += len(rows)
+            written_total += len(rows_result)
 
         progress.elapsed = time.perf_counter() - start_time
         logger.info(
@@ -397,7 +421,7 @@ def _block_allele_info(
     indices: npt.NDArray[np.uint32],
     block,
     allele_label: str,
-) -> tuple[npt.NDArray[np.int8] | None, list[str]]:
+) -> tuple[npt.NDArray[np.int8] | None, npt.NDArray[np.str_]]:
     """Per-row major-allele sign and coding allele for a block.
 
     In ``REF`` mode the reported r needs no sign adjustment
@@ -406,10 +430,10 @@ def _block_allele_info(
     """
 
     if allele_label == "REF":
-        return None, [ds.ref_allele(int(i)) for i in indices]
+        return None, np.asarray([ds.ref_allele(int(i)) for i in indices])
 
     sample_ct = ds.active_sample_ct
-    signs = np.ones(len(indices), dtype=np.int8)
+    signs = [1] * len(indices)
     alleles = [""] * len(indices)
 
     for row, position in enumerate(block.dense_rows.tolist()):
@@ -428,7 +452,7 @@ def _block_allele_info(
             ds.alt_allele(index) if flipped else ds.ref_allele(index)
         )
 
-    return signs, alleles
+    return np.asarray(signs, dtype=np.int8), np.asarray(alleles)
 
 
 def main(argv: list[str] | None = None) -> int:

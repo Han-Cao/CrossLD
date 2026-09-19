@@ -141,10 +141,10 @@ def test_debug_logs_per_block_statistics(
         "mode=hardcall",
         "dense_variants=",
         "sparse_variants=",
-        "pairs_evaluated=",
         "pairs_kept=",
         "pairs_below_r2=",
-        "pairs_skipped=",
+        "skip_missing=",
+        "skip_low_variance=",
         "elapsed=",
     ):
         assert field in first, f"{field!r} missing from {first!r}"
