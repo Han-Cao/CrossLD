@@ -158,32 +158,6 @@ def _sparse_value_masks(values: list[npt.NDArray]) -> list[npt.NDArray[np.bool_]
 
 
 # --------------------------------------------------------------------------- #
-# target-level quality control
-# --------------------------------------------------------------------------- #
-
-def target_qc(target: npt.NDArray) -> str | None:
-    """Per-target skip reason, or ``None`` when the target can be evaluated.
-
-    Unlike the per-pair sanity checks this depends only on the target vector, so
-    a caller that evaluates one target against many blocks can ask once and skip
-    the block reads entirely. Returns :data:`SKIP_MISSING` when fewer than
-    ``_MIN_SAMPLES`` samples are usable, :data:`SKIP_LOW_VARIANCE` when the
-    target is constant over its usable samples (so every pairwise correlation is
-    undefined), and ``None`` otherwise.
-    """
-
-    target = np.asarray(target)
-    checked = target >= 0
-    n_keep = int(checked.sum())
-    if n_keep < _MIN_SAMPLES:
-        return SKIP_MISSING
-    seen = target[checked]
-    if bool(seen.min() == seen.max()):
-        return SKIP_LOW_VARIANCE
-    return None
-
-
-# --------------------------------------------------------------------------- #
 # cancellation heuristics
 # --------------------------------------------------------------------------- #
 
@@ -237,6 +211,29 @@ def _out_of_range(r: npt.NDArray[np.float64]) -> npt.NDArray[np.bool_]:
 # --------------------------------------------------------------------------- #
 # sanity checks
 # --------------------------------------------------------------------------- #
+
+
+def target_qc(target: npt.NDArray) -> str | None:
+    """Per-target skip reason, or ``None`` when the target can be evaluated.
+
+    Unlike the per-pair sanity checks this depends only on the target vector, so
+    a caller that evaluates one target against many blocks can ask once and skip
+    the block reads entirely. Returns :data:`SKIP_MISSING` when fewer than
+    ``_MIN_SAMPLES`` samples are usable, :data:`SKIP_LOW_VARIANCE` when the
+    target is constant over its usable samples (so every pairwise correlation is
+    undefined), and ``None`` otherwise.
+    """
+
+    target = np.asarray(target)
+    checked = target >= 0
+    n_keep = int(checked.sum())
+    if n_keep < _MIN_SAMPLES:
+        return SKIP_MISSING
+    seen = target[checked]
+    if bool(seen.min() == seen.max()):
+        return SKIP_LOW_VARIANCE
+    return None
+
 
 def _dense_pairwise_constant(
     target: npt.NDArray[np.float64],
@@ -472,22 +469,19 @@ def _centered_sparse(
     if n_rows == 0:
         return r
 
-    # Values the target contributes to any pair: every sample when it has no
-    # missing call, otherwise only its valid samples.
     t_values = target if target_valid is None else target[target_valid]
-    if t_values.size == 0 or bool(t_values.min() == t_values.max()):
-        # A constant target makes every pairwise correlation undefined.
-        return r
+    # no need target-only const check here, ensured in crossld() call
+    # if t_values.size == 0 or bool(t_values.min() == t_values.max()):
+    #     # A constant target makes every pairwise correlation undefined.
+    #     return r
 
-    mu = float(t_values.sum()) / int(t_values.size)
-    aprime = target - mu if target_valid is None else np.where(target_valid, target - mu, 0.0)
-    a1 = float(aprime.sum())
-    a2 = float(aprime @ aprime)
+    t_mean = float(t_values.sum()) / int(t_values.size)
+    da = target - t_mean if target_valid is None else np.where(target_valid, target - t_mean, 0.0)
+    da1 = float(da.sum())
+    da2 = float(da @ da)
 
-    # Sorted distinct target values are only needed to test a *pairwise subset*
-    # for constancy, which requires the block row to drop samples. Without
-    # missing block calls the pairwise set is the whole valid target, already
-    # known to be non-constant.
+    # Unique count for target values are only needed to test a pairwise subset
+    # for constancy, which requires the block row to drop samples.
     t_sorted: npt.NDArray | None = None
     t_counts: npt.NDArray | None = None
     if value_valid is not None:
@@ -497,13 +491,11 @@ def _centered_sparse(
         if bad[row]:
             continue
         nr = int(n[row])
-        if nr <= 0:
-            continue
 
-        idx = np.asarray(sample_idxs[row])
+        sid = np.asarray(sample_idxs[row])
         vals = np.asarray(values[row], dtype=np.float64)
         in_target = (
-            np.ones(idx.size, dtype=bool) if target_valid is None else target_valid[idx]
+            np.ones(sid.size, dtype=bool) if target_valid is None else target_valid[sid]
         )
         if value_valid is None:
             keep = in_target
@@ -513,48 +505,54 @@ def _centered_sparse(
             keep = in_target & mask
             drop = in_target & ~mask
 
-        # Exact constancy of the target over the pairwise-valid samples: at most
-        # one distinct target value may survive the dropped samples.
+        # Check target constancy on the pairwise-valid samples:
+        # only if drop number more than unique target values need this check
+        # otherwise must not be constant among the pairwise-valid samples
+        # note: t_sorted is not None ensure drop is not None
         if t_sorted is not None and int(drop.sum()) >= t_sorted.size - 1:
-            dropped_values = target[idx[drop]]
+            dropped_values = target[sid[drop]]
             uniq, counts = np.unique(dropped_values, return_counts=True)
             positions = np.searchsorted(t_sorted, uniq)
-            if t_sorted.size - int(np.count_nonzero(counts == t_counts[positions])) == 1:
+            # np.count_nonzero(counts == t_counts[positions]) find number of
+            # unique values that have been fully dropped
+            # so t_sorted.size - this -> number of remaining unique values
+            if t_sorted.size - int(np.count_nonzero(counts == t_counts[positions])) <= 1:
                 continue
 
         # Block-row values over the pairwise-valid set are the listed valid
-        # values plus one implicit 0 per unlisted valid sample; the row is
-        # constant when they all agree (or when there are no listed values).
-        kept_values = vals[keep]
-        if kept_values.size == 0:
-            continue
-        implicit = nr - int(kept_values.size)
-        if implicit > 0:
-            if bool(kept_values.min() == 0.0 and kept_values.max() == 0.0):
-                continue
-        elif bool(kept_values.min() == kept_values.max()):
-            continue
+        # values and implicit 0 per unlisted valid sample.
+        kept_vals = vals[keep]
+        n_implicit = nr - int(kept_vals.size)
 
-        a = aprime[idx]
-        sum_b = float(kept_values.sum())
+        # Block row constancy check has been ensured in _check_sparse_sample_ct_block_const
+        # if kept_values.size == 0:
+        #     continue
+        # if n_implicit > 0:
+        #     if bool(kept_values.min() == 0.0 and kept_values.max() == 0.0):
+        #         continue
+        # elif bool(kept_values.min() == kept_values.max()):
+        #     continue
+
+        sparse_a = da[sid]
+        sum_b = float(kept_vals.sum())
         mean_b = sum_b / nr
         if drop is not None:
-            dropped_a = a[drop]
-            d1 = float(dropped_a.sum())
-            d2 = float(dropped_a @ dropped_a)
+            dropped_a = sparse_a[drop]
+            bad_da1 = float(dropped_a.sum())
+            bad_da2 = float(dropped_a @ dropped_a)
         else:
-            d1 = 0.0
-            d2 = 0.0
-        sum_a = a1 - d1
+            bad_da1 = 0.0
+            bad_da2 = 0.0
+        sum_a = da1 - bad_da1
         mean_a = sum_a / nr
 
-        var_a = (a2 - d2) - nr * mean_a * mean_a
-        var_b = float((kept_values - mean_b) @ (kept_values - mean_b)) + (
-            implicit * mean_b * mean_b
+        var_a = (da2 - bad_da2) - nr * mean_a * mean_a
+        var_b = float((kept_vals - mean_b) @ (kept_vals - mean_b)) + (
+            n_implicit * mean_b * mean_b
         )
         # Folding the implicit-zero columns into the pairwise sum of
         # (a - mean_a) * (b - mean_b) leaves only the listed contributions.
-        cov = float(a[keep] @ kept_values) - mean_b * sum_a
+        cov = float(sparse_a[keep] @ kept_vals) - mean_b * sum_a
         if var_a > 0.0 and var_b > 0.0:
             # sqrt(var_a) * sqrt(var_b): the product of two representable
             # variances can underflow even when the correlation is fine.
