@@ -125,9 +125,11 @@ class BlockCache:
     position order produced by :func:`~crossld.plinkio.candidate_indices`.
     :meth:`plan` reuses entries by intersecting them with a target's candidates
     and returning contiguous slices (numpy views for dense rows, shared per-row
-    arrays for sparse rows); :meth:`restamp` rebuilds the cache from the blocks
-    actually used, keeping the rightmost ``limit`` whose overlap with the next
-    target's candidates is strictly greater than ``min_overlap``.
+    arrays for sparse rows). Cache updating is **streaming** -- :meth:`begin`,
+    :meth:`consider` per used block, then :meth:`commit` -- so at most
+    ``limit`` blocks (plus the one being considered) are ever held, keeping the
+    rightmost ``limit`` whose overlap with the next target's candidates is
+    strictly greater than ``min_overlap``.
 
     The cache never changes results: ``limit <= 0`` leaves it empty and
     :meth:`plan` degenerates to plain ``block_size`` chunking.
@@ -137,6 +139,7 @@ class BlockCache:
         self.limit = int(limit)
         self.min_overlap = float(min_overlap)
         self._entries: list[_CachedBlock] = []
+        self._pending: list[_CachedBlock] = []
         self.reused_variants = 0
 
     @property
@@ -226,33 +229,57 @@ class BlockCache:
         used: list[tuple[npt.NDArray[np.uint32], BlockMatrix]],
         next_candidates: npt.NDArray[np.uint32],
     ) -> None:
-        """Rebuild the cache from this target's blocks for the next target.
+        """Rebuild the cache from a materialized list of this target's blocks.
 
-        Keep every ``(indices, block)`` whose overlap with ``next_candidates``
-        is strictly greater than ``min_overlap`` and retain the rightmost
-        ``limit``. Blocks that are themselves views are stored as-is (cheap; the
-        numpy view keeps the base array alive).
+        Convenience wrapper over :meth:`begin` / :meth:`consider` / :meth:`commit`
+        for callers and tests that already hold every block. The production loop
+        calls the streaming methods directly so it never materializes a target's
+        blocks (that would pin every decoded block in memory).
         """
 
-        self._entries = []
+        self.begin()
+        for indices, block in used:
+            self.consider(indices, block, next_candidates)
+        self.commit()
+
+    def begin(self) -> None:
+        """Start collecting this target's blocks (pair with :meth:`commit`)."""
+
+        self._pending = []
+
+    def consider(
+        self,
+        indices: npt.NDArray[np.uint32],
+        block: BlockMatrix,
+        next_candidates: npt.NDArray[np.uint32],
+    ) -> None:
+        """Offer one used target block to the cache for the next target.
+
+        Block order is candidate (= position) order, so holding only the last
+        ``limit`` eligible blocks keeps the rightmost. Bounded memory: at most
+        ``limit`` blocks are retained regardless of how many were used.
+        """
+
         if self.limit <= 0:
             return
         nxt = np.asarray(next_candidates, dtype=np.uint32)
         if nxt.size == 0:
             return
+        arr = np.asarray(indices, dtype=np.uint32)
+        if arr.size == 0:
+            return
+        overlap = int(np.intersect1d(arr, nxt, assume_unique=True).size)
+        if overlap / arr.size <= self.min_overlap:
+            return
+        self._pending.append(_CachedBlock(indices=arr.copy(), block=block))
+        if len(self._pending) > self.limit:
+            self._pending.pop(0)
 
-        selected: list[_CachedBlock] = []
-        for indices, block in used:
-            arr = np.asarray(indices, dtype=np.uint32)
-            if arr.size == 0:
-                continue
-            overlap = int(np.intersect1d(arr, nxt, assume_unique=True).size)
-            if overlap / arr.size > self.min_overlap:
-                selected.append(_CachedBlock(indices=arr.copy(), block=block))
+    def commit(self) -> None:
+        """Make the blocks collected by :meth:`consider` the live cache."""
 
-        if len(selected) > self.limit:
-            selected = selected[-self.limit:]
-        self._entries = selected
+        self._entries = self._pending
+        self._pending = []
 
 
 @dataclass

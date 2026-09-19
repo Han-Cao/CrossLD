@@ -12,7 +12,7 @@ import numpy as np
 import numpy.typing as npt
 
 from crossld import __version__
-from crossld.blocks import BlockCache, BlockMatrix, BlockReader
+from crossld.blocks import BlockCache, BlockReader
 from crossld.ld import (
     SKIP_LOW_VARIANCE,
     SKIP_MISSING,
@@ -296,15 +296,15 @@ def crossld(
 
         planned = cache.plan(candidates, block_size)
         block_total = len(planned)
-        used: list[tuple[npt.NDArray[np.uint32], BlockMatrix]] = []
+        cache.begin()
         for block_no, (block_var_idx, cached_block) in enumerate(planned, start=1):
             if skip_reason is not None:
                 # no fresh reads; keep the cached views for the next target
                 if cached_block is not None:
-                    used.append((block_var_idx, cached_block))
+                    cache.consider(block_var_idx, cached_block, keep_for_next)
                 continue
             block = cached_block if cached_block is not None else reader2.read(block_var_idx)
-            used.append((block_var_idx, block))
+            cache.consider(block_var_idx, block, keep_for_next)
             block_stats = block.stats
             block_stats.block_index = block_no
             block_stats.block_total = block_total
@@ -386,8 +386,8 @@ def crossld(
                 time.perf_counter() - start_time,
             )
 
-        # rebuild the cache from this target's blocks for the next target
-        cache.restamp(used, keep_for_next)
+        # make this target's rightmost eligible blocks the cache for the next
+        cache.commit()
 
         if rows_result:
             pos_b = np.array([ds2.pos[x[0]] for x in rows_result], dtype=np.uint32)
