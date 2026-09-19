@@ -14,6 +14,9 @@ import pytest
 
 from crossld.blocks import BlockMatrix, BlockStats
 from crossld.ld import (
+    SKIP_LOW_VARIANCE,
+    SKIP_MISSING,
+    _check_sparse_sample_ct_block_const,
     alt_freq,
     alt_freq_sparse,
     centered_moment_ld_dense,
@@ -23,6 +26,7 @@ from crossld.ld import (
     pearson_pairwise_block,
     raw_moment_ld_dense,
     raw_moment_ld_sparse,
+    target_qc,
 )
 from tests.conftest import pearson_reference, pearson_reference_stable
 
@@ -662,3 +666,109 @@ def test_dense_sparse_raw_equivalence_with_implicit_zeros():
     r_sparse, n_sparse = raw_moment_ld_sparse(target, list(idxs), list(values))
     assert np.array_equal(n_dense, n_sparse)
     assert np.allclose(r_dense, r_sparse, atol=1e-12, equal_nan=True)
+
+
+# --------------------------------------------------------------------------- #
+# target-level QC and the lean sparse sample-count check
+# ---------------------------------------------------------------------------
+
+def test_target_qc_reports_missing_low_variance_and_ok():
+    assert target_qc(np.array([-9.0, 1.0, -9.0, -9.0, -9.0, -9.0])) == SKIP_MISSING
+    assert target_qc(np.full(6, -9.0)) == SKIP_MISSING
+    assert target_qc(np.array([])) == SKIP_MISSING
+    assert target_qc(np.full(6, 0.1)) == SKIP_LOW_VARIANCE
+    # constant over the valid samples only
+    assert target_qc(np.array([2.0, 2.0, 2.0, -9.0, -9.0, -9.0])) == SKIP_LOW_VARIANCE
+    assert target_qc(TARGET) is None
+    assert target_qc(np.array([0.0, 1.0, 2.0])) is None
+
+
+def test_check_sample_ct_sparse_counts_pairwise_valid_and_block_constancy():
+    target = np.array([0.0, 1.0, 2.0, 0.0, 1.0, 2.0])
+    idx = np.arange(6, dtype=np.uint32)
+
+    values = [np.array([0.0, 1.0, -9.0, 1.0, 2.0, 2.0])]
+    n, bad = _check_sparse_sample_ct_block_const(target, [idx], values, None, [values[0] >= 0])
+    assert int(n[0]) == 5
+    assert not bad[0]
+
+    values = [np.full(6, 2.0), np.array([-9.0, -9.0, -9.0, -9.0, 1.0, 2.0])]
+    n, bad = _check_sparse_sample_ct_block_const(
+        target, [idx, idx], values, None, [v >= 0 for v in values]
+    )
+    assert list(int(x) for x in n) == [6, 2]  # constant row, then n < 3
+    assert list(bad) == [True, True]
+
+
+def test_check_sample_ct_sparse_ignores_pairwise_constant_target():
+    # The target is constant only on the pairwise-valid samples; this check no
+    # longer flags it (the centered kernel does), but n is still correct.
+    target = np.array([0.1, 0.2, 0.3, 500.0, 500.0, 500.0])
+    idx = np.arange(6, dtype=np.uint32)
+    values = [np.array([-9.0, -9.0, -9.0, 4.0, 5.0, 6.0])]
+    n, bad = _check_sparse_sample_ct_block_const(target, [idx], values, None, [values[0] >= 0])
+    assert int(n[0]) == 3
+    assert not bad[0]
+
+
+# --------------------------------------------------------------------------- #
+# sparse centered moments (native, no densification)
+# --------------------------------------------------------------------------- #
+
+def test_sparse_centered_constant_target_on_pairwise_subset_is_nan():
+    target = np.array([0.1, 0.2, 0.3, 500.0, 500.0, 500.0])
+    idx = np.arange(6, dtype=np.uint32)
+    values = np.array([-9.0, -9.0, -9.0, 4.0, 5.0, 6.0])
+    r, n = centered_moment_ld_sparse(target, [idx], [values], compute_mask=True)
+    assert int(n[0]) == 3
+    assert np.isnan(float(r[0]))
+
+
+@pytest.mark.parametrize(
+    "target, row",
+    [
+        (np.full(6, 2.0), np.array([0.0, 1.0, 2.0, 0.0, 1.0, 2.0])),
+        (TARGET, np.full(6, 2.0)),
+        (np.array([0.0, 1e-100, 2e-100]), np.array([0.0, 1e-100, 2e-100])),
+        (np.array([0.0, 1e-100, 2e-100]), np.array([0.0, -9.0, 2e-100])),
+    ],
+    ids=["constant-target", "constant-row", "tiny-variance", "tiny-variance-missing"],
+)
+def test_sparse_centered_matches_dense_on_degenerate_cases(target, row):
+    idx, values = _sparsify(row)
+    r_dense, n_dense = centered_moment_ld_dense(target, row[None, :], compute_mask=True)
+    r_sparse, n_sparse = centered_moment_ld_sparse(
+        target, [idx], [values], compute_mask=True
+    )
+    assert int(n_sparse[0]) == int(n_dense[0])
+    if np.isnan(r_dense[0]):
+        assert np.isnan(float(r_sparse[0]))
+    else:
+        assert float(r_sparse[0]) == pytest.approx(float(r_dense[0]), abs=1e-12)
+
+
+def test_sparse_centered_matches_stable_oracle_on_hard_cases():
+    rng = np.random.default_rng(97)
+    near_target = 1e-8 + rng.normal(0.0, 1e-11, 60)
+    near_rows = 1e-8 + rng.normal(0.0, 1e-12, (5, 60))
+    extreme_target = rng.random(40) * 1e120
+    extreme_rows = rng.random((4, 40)) * 1e-120
+    missing_target = rng.integers(0, 3, 80).astype(float)
+    missing_target[rng.random(80) < 0.4] = -9.0
+    missing_rows = rng.integers(0, 3, (6, 80)).astype(float)
+    missing_rows[rng.random(missing_rows.shape) < 0.4] = -9.0
+
+    for target, block in (
+        (near_target, near_rows),
+        (extreme_target, extreme_rows),
+        (missing_target, missing_rows),
+    ):
+        for row in block:
+            idx, values = _sparsify(row)
+            r, n = centered_moment_ld_sparse(target, [idx], [values], compute_mask=True)
+            expected, expected_n = pearson_reference_stable(target, row)
+            assert int(n[0]) == expected_n
+            if np.isnan(expected):
+                assert np.isnan(float(r[0]))
+            else:
+                assert float(r[0]) == pytest.approx(expected, abs=1e-9)

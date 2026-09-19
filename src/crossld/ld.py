@@ -158,6 +158,32 @@ def _sparse_value_masks(values: list[npt.NDArray]) -> list[npt.NDArray[np.bool_]
 
 
 # --------------------------------------------------------------------------- #
+# target-level quality control
+# --------------------------------------------------------------------------- #
+
+def target_qc(target: npt.NDArray) -> str | None:
+    """Per-target skip reason, or ``None`` when the target can be evaluated.
+
+    Unlike the per-pair sanity checks this depends only on the target vector, so
+    a caller that evaluates one target against many blocks can ask once and skip
+    the block reads entirely. Returns :data:`SKIP_MISSING` when fewer than
+    ``_MIN_SAMPLES`` samples are usable, :data:`SKIP_LOW_VARIANCE` when the
+    target is constant over its usable samples (so every pairwise correlation is
+    undefined), and ``None`` otherwise.
+    """
+
+    target = np.asarray(target)
+    checked = target >= 0
+    n_keep = int(checked.sum())
+    if n_keep < _MIN_SAMPLES:
+        return SKIP_MISSING
+    seen = target[checked]
+    if bool(seen.min() == seen.max()):
+        return SKIP_LOW_VARIANCE
+    return None
+
+
+# --------------------------------------------------------------------------- #
 # cancellation heuristics
 # --------------------------------------------------------------------------- #
 
@@ -209,7 +235,7 @@ def _out_of_range(r: npt.NDArray[np.float64]) -> npt.NDArray[np.bool_]:
 
 
 # --------------------------------------------------------------------------- #
-# sanity checks (run before any moment math)
+# sanity checks
 # --------------------------------------------------------------------------- #
 
 def _dense_pairwise_constant(
@@ -253,7 +279,7 @@ def _dense_pairwise_constant(
     return t_const, b_const
 
 
-def _check_sample_ct_dense(
+def _check_dense_sample_ct(
     target: npt.NDArray[np.float64],
     block: npt.NDArray,
     target_valid: npt.NDArray[np.bool_] | None,
@@ -279,71 +305,66 @@ def _check_sample_ct_dense(
     return n, bad
 
 
-def _sanity_sparse(
+def _check_sparse_sample_ct_block_const(
     target: npt.NDArray[np.float64],
     sample_idxs: list[npt.NDArray[np.uint32]],
     values: list[npt.NDArray],
     target_valid: npt.NDArray[np.bool_] | None,
     value_valid: list[npt.NDArray[np.bool_]] | None,
 ) -> tuple[npt.NDArray[np.uint32], npt.NDArray[np.bool_]]:
-    """Pairwise sample count and per-row ``NaN`` decision for sparse rows."""
+    """Pairwise sample count and per-row ``NaN`` decision for sparse rows.
+
+       Return (per-row non-missing sample count, per-row < _MIN_SAMPLES | block const).
+
+       Only the sample count and the cheap O(nnz) block-row constancy are checked
+       here. Constancy of the target over the pairwise-valid set O(sample_ct) is 
+       left to the centered method (same as dense's strategy).
+    """
 
     n_rows = len(sample_idxs)
-    if target_valid is None:
-        n_keep = int(target.size)
-        t_global_const = bool(target.size == 0 or target.min() == target.max())
-    else:
-        n_keep = int(target_valid.sum())
-        t_seen = target[target_valid]
-        t_global_const = bool(t_seen.size == 0 or t_seen.min() == t_seen.max())
+    n_keep = int(target.size) if target_valid is None else int(target_valid.sum())
 
-    # np.empty is safe here since every row are processed in loop without continue
-    n_out = np.empty(n_rows, dtype=np.uint32)
-    t_const = np.empty(n_rows, dtype=bool)
+    # np.empty is safe here since every row is processed in the loop below
+    n = np.empty(n_rows, dtype=np.uint32)
     b_const = np.empty(n_rows, dtype=bool)
 
     for row in range(n_rows):
         idx = np.asarray(sample_idxs[row])
         vals = np.asarray(values[row], dtype=np.float64)
+        # block only valid mask
         mask = None if value_valid is None else np.asarray(value_valid[row], dtype=bool)
 
+        # in_target: boolean mask of sparse values for valid samples in target
         if target_valid is None:
             in_target = np.ones(idx.size, dtype=bool)
         else:
             in_target = target_valid[idx]
 
         if mask is None:
-            dropped_mask = np.zeros(idx.size, dtype=bool)
+            dropped = 0
         else:
-            dropped_mask = in_target & ~mask
-        dropped = int(dropped_mask.sum())
-        n = n_keep - dropped
-        n_out[row] = n
+            # valid only in target needs to be dropped
+            dropped = int((in_target & ~mask).sum())
+        n_both_valid = n_keep - dropped
+        n[row] = n_both_valid
 
-        # Block-row values over the pairwise-valid set are the listed valid
-        # values plus one implicit 0 per unlisted valid sample.
-        listed_valid = vals[in_target & (mask if mask is not None else True)]
-        if listed_valid.size == 0:
+        # vals_both_valid: values in non-missing samples of target and this row
+        vals_both_valid = vals[in_target & (mask if mask is not None else True)]
+        if vals_both_valid.size == 0:
             b_const[row] = True
-        elif n > listed_valid.size:
-            b_const[row] = bool(listed_valid.min() == 0.0 and listed_valid.max() == 0.0)
+        # in most cases, both valid samples are more than samples with sparse values
+        # so as long as any both valid samples have non-zero values, the block is not const
+        elif n_both_valid > vals_both_valid.size:
+            b_const[row] = bool(vals_both_valid.min() == 0.0 and vals_both_valid.max() == 0.0)
+        # very rare case:
+        # n_both_valid == vals_both_valid.size, meaning all target's valid samples
+        # are present in the sparse data, then need to check if sparse values are const
+        # this case, the implicit zero values are invalid in the target
         else:
-            b_const[row] = bool(listed_valid.min() == listed_valid.max())
+            b_const[row] = bool(vals_both_valid.min() == vals_both_valid.max())
 
-        if t_global_const or dropped == 0:
-            t_const[row] = t_global_const
-        else:
-            observed = (
-                np.ones(target.size, dtype=bool)
-                if target_valid is None
-                else target_valid.copy()
-            )
-            observed[idx[dropped_mask]] = False
-            seen = target[observed]
-            t_const[row] = bool(seen.size == 0 or seen.min() == seen.max())
-
-    bad = (n_out < _MIN_SAMPLES) | t_const | b_const
-    return n_out, bad
+    bad = (n < _MIN_SAMPLES) | b_const
+    return n, bad
 
 
 # --------------------------------------------------------------------------- #
@@ -391,8 +412,9 @@ def _centered_dense(
     var_a = (da * da).sum(axis=1)
     var_b = (db * db).sum(axis=1)
     with np.errstate(invalid="ignore", divide="ignore"):
-        # sqrt(var_a) * sqrt(var_b): the product of two representable variances
-        # can underflow even when the correlation is fine.
+        # sqrt(var_a) * sqrt(var_b) is better than sqrt(var_a * var_b) 
+        # since the product of two representable variances can underflow 
+        # even when the correlation is fine.
         r = (da * db).sum(axis=1) / (np.sqrt(var_a) * np.sqrt(var_b))
 
     good = ~(bad | t_const | b_const | ~np.isfinite(r))
@@ -400,7 +422,7 @@ def _centered_dense(
 
 
 def centered_moment_ld_dense(
-    target: npt.NDArray,
+    target: npt.NDArray[np.float64],
     block: npt.NDArray,
     target_valid: npt.NDArray[np.bool_] | None = None,
     block_valid: npt.NDArray[np.bool_] | None = None,
@@ -418,7 +440,7 @@ def centered_moment_ld_dense(
     block = np.atleast_2d(block)
     tv = _resolve_target_mask(target, target_valid, compute_mask)
     bv = _resolve_dense_block_mask(block, block_valid, compute_mask)
-    n, bad = _check_sample_ct_dense(t, block, tv, bv)
+    n, bad = _check_dense_sample_ct(t, block, tv, bv)
     r = _centered_dense(t, block, tv, bv, n, bad)
     return np.clip(r, -1.0, 1.0), n
 
@@ -432,21 +454,115 @@ def _centered_sparse(
     n: npt.NDArray[np.uint32],
     bad: npt.NDArray[np.bool_],
 ) -> npt.NDArray[np.float64]:
-    """Centered pairwise r for sparse rows (densified as one block)."""
+    """Centered pairwise r for sparse rows, without densifying them.
+
+    ``a`` is the target side and ``b`` the sparse block side. Because unlisted
+    samples are exactly 0, the pairwise sums collapse to the listed entries plus
+    a closed-form implicit-zero term, so the whole computation is O(nnz). The 
+    target is shifted by its global valid mean so ``var_a`` stays well conditioned.
+
+    The moment form of ``var_a`` is only zero up to rounding (unlike an explicit
+    mean subtraction), so a target or block row that is constant over the
+    pairwise-valid set would otherwise produce a finite ``r`` from a ratio of
+    rounding noise. Both cases are detected exactly and reported as ``NaN``.
+    """
 
     n_rows = len(sample_idxs)
+    r = np.full(n_rows, np.nan, dtype=np.float64)
     if n_rows == 0:
-        return np.full(0, np.nan, dtype=np.float64)
+        return r
 
-    sample_ct = int(target.size)
-    dense = np.zeros((n_rows, sample_ct), dtype=np.float64)
-    dense_valid = np.ones((n_rows, sample_ct), dtype=bool)
+    # Values the target contributes to any pair: every sample when it has no
+    # missing call, otherwise only its valid samples.
+    t_values = target if target_valid is None else target[target_valid]
+    if t_values.size == 0 or bool(t_values.min() == t_values.max()):
+        # A constant target makes every pairwise correlation undefined.
+        return r
+
+    mu = float(t_values.sum()) / int(t_values.size)
+    aprime = target - mu if target_valid is None else np.where(target_valid, target - mu, 0.0)
+    a1 = float(aprime.sum())
+    a2 = float(aprime @ aprime)
+
+    # Sorted distinct target values are only needed to test a *pairwise subset*
+    # for constancy, which requires the block row to drop samples. Without
+    # missing block calls the pairwise set is the whole valid target, already
+    # known to be non-constant.
+    t_sorted: npt.NDArray | None = None
+    t_counts: npt.NDArray | None = None
+    if value_valid is not None:
+        t_sorted, t_counts = np.unique(t_values, return_counts=True)
+
     for row in range(n_rows):
+        if bad[row]:
+            continue
+        nr = int(n[row])
+        if nr <= 0:
+            continue
+
         idx = np.asarray(sample_idxs[row])
-        dense[row, idx] = np.asarray(values[row], dtype=np.float64)
-        if value_valid is not None:
-            dense_valid[row, idx] = np.asarray(value_valid[row], dtype=bool)
-    return _centered_dense(target, dense, target_valid, dense_valid, n, bad)
+        vals = np.asarray(values[row], dtype=np.float64)
+        in_target = (
+            np.ones(idx.size, dtype=bool) if target_valid is None else target_valid[idx]
+        )
+        if value_valid is None:
+            keep = in_target
+            drop = None
+        else:
+            mask = np.asarray(value_valid[row], dtype=bool)
+            keep = in_target & mask
+            drop = in_target & ~mask
+
+        # Exact constancy of the target over the pairwise-valid samples: at most
+        # one distinct target value may survive the dropped samples.
+        if t_sorted is not None and int(drop.sum()) >= t_sorted.size - 1:
+            dropped_values = target[idx[drop]]
+            uniq, counts = np.unique(dropped_values, return_counts=True)
+            positions = np.searchsorted(t_sorted, uniq)
+            if t_sorted.size - int(np.count_nonzero(counts == t_counts[positions])) == 1:
+                continue
+
+        # Block-row values over the pairwise-valid set are the listed valid
+        # values plus one implicit 0 per unlisted valid sample; the row is
+        # constant when they all agree (or when there are no listed values).
+        kept_values = vals[keep]
+        if kept_values.size == 0:
+            continue
+        implicit = nr - int(kept_values.size)
+        if implicit > 0:
+            if bool(kept_values.min() == 0.0 and kept_values.max() == 0.0):
+                continue
+        elif bool(kept_values.min() == kept_values.max()):
+            continue
+
+        a = aprime[idx]
+        sum_b = float(kept_values.sum())
+        mean_b = sum_b / nr
+        if drop is not None:
+            dropped_a = a[drop]
+            d1 = float(dropped_a.sum())
+            d2 = float(dropped_a @ dropped_a)
+        else:
+            d1 = 0.0
+            d2 = 0.0
+        sum_a = a1 - d1
+        mean_a = sum_a / nr
+
+        var_a = (a2 - d2) - nr * mean_a * mean_a
+        var_b = float((kept_values - mean_b) @ (kept_values - mean_b)) + (
+            implicit * mean_b * mean_b
+        )
+        # Folding the implicit-zero columns into the pairwise sum of
+        # (a - mean_a) * (b - mean_b) leaves only the listed contributions.
+        cov = float(a[keep] @ kept_values) - mean_b * sum_a
+        if var_a > 0.0 and var_b > 0.0:
+            # sqrt(var_a) * sqrt(var_b): the product of two representable
+            # variances can underflow even when the correlation is fine.
+            value = cov / (np.sqrt(var_a) * np.sqrt(var_b))
+            if np.isfinite(value):
+                r[row] = value
+
+    return np.clip(r, -1.0, 1.0)
 
 
 def centered_moment_ld_sparse(
@@ -468,7 +584,7 @@ def centered_moment_ld_sparse(
     t = np.asarray(target, dtype=np.float64)
     tv = _resolve_target_mask(target, target_valid, compute_mask)
     vv = _resolve_sparse_value_masks(values, value_valid, compute_mask)
-    n, bad = _sanity_sparse(t, sample_idxs, values, tv, vv)
+    n, bad = _check_sparse_sample_ct_block_const(t, sample_idxs, values, tv, vv)
     r = _centered_sparse(t, sample_idxs, values, tv, vv, n, bad)
     return np.clip(r, -1.0, 1.0), n
 
@@ -665,7 +781,7 @@ def raw_moment_ld_dense(
     block = np.atleast_2d(block)
     tv = _resolve_target_mask(target, target_valid, compute_mask)
     bv = _resolve_dense_block_mask(block, block_valid, compute_mask)
-    n, bad = _check_sample_ct_dense(t, block, tv, bv)
+    n, bad = _check_dense_sample_ct(t, block, tv, bv)
     r, _ = _raw_dense_sums(t, block, tv, bv, n, bad)
     return np.clip(r, -1.0, 1.0), n
 
@@ -686,6 +802,9 @@ def _raw_sparse_sums(
     if n_rows == 0:
         return r, np.zeros(0, dtype=bool)
 
+    # target_valid None -> all valid
+    # weighted[j] is target genotype (mis as 0) used as weight for bincount
+    # sum_t0 / sum_t20 are the target moments over every valid target sample
     if target_valid is None:
         weighted = target
         sum_t0 = float(target.sum())
@@ -695,32 +814,39 @@ def _raw_sparse_sums(
         sum_t0 = float(weighted.sum())
         sum_t20 = float(weighted @ weighted)
 
+    # no. of present samples per row
     lengths = np.fromiter(
         (int(np.asarray(idx).size) for idx in sample_idxs),
         dtype=np.uint32,
         count=n_rows,
     )
-    row_ids = np.repeat(np.arange(n_rows, dtype=np.uint32), lengths)
-    if row_ids.size:
-        v_all = np.concatenate([np.asarray(v, dtype=np.float64) for v in values])
-        i_all = np.concatenate(
+
+    # flatten row index of values present in the sparse block
+    # e.g., row_ids[n] == 1 means nth flat value belong to row 1
+    rid_flat = np.repeat(np.arange(n_rows, dtype=np.uint32), lengths)
+    if rid_flat.size:
+        # flatten sparse values and sample index
+        v_flat = np.concatenate([np.asarray(v, dtype=np.float64) for v in values])
+        sid_flat = np.concatenate(
             [np.asarray(idx, dtype=np.uint32) for idx in sample_idxs]
         )
+        # flatten sparse valid mask
         if value_valid is None:
-            listed_valid = np.ones(row_ids.size, dtype=bool)
+            sparse_valid_flat = np.ones(rid_flat.size, dtype=bool)
         else:
-            listed_valid = np.concatenate(
+            sparse_valid_flat = np.concatenate(
                 [np.asarray(mask, dtype=bool) for mask in value_valid]
             )
     else:
-        v_all = np.empty(0, dtype=np.float64)
-        i_all = np.empty(0, dtype=np.uint32)
-        listed_valid = np.empty(0, dtype=bool)
+        v_flat = np.empty(0, dtype=np.float64)
+        sid_flat = np.empty(0, dtype=np.uint32)
+        sparse_valid_flat = np.empty(0, dtype=bool)
 
+    # rid_in_target: flat boolean mask of sparse values for valid samples in target
     if target_valid is None:
-        in_target = np.ones(row_ids.size, dtype=bool)
+        rid_in_target = np.ones(rid_flat.size, dtype=bool)
     else:
-        in_target = target_valid[i_all]
+        rid_in_target = target_valid[sid_flat]
 
     sum_t = np.full(n_rows, sum_t0, dtype=np.float64)
     sum_t2 = np.full(n_rows, sum_t20, dtype=np.float64)
@@ -730,21 +856,24 @@ def _raw_sparse_sums(
     sum_x2 = np.zeros(n_rows, dtype=np.float64)
     sum_xt = np.zeros(n_rows, dtype=np.float64)
 
-    if row_ids.size:
-        both = in_target & listed_valid
-        if both.any():
-            ids = row_ids[both]
-            vals = v_all[both]
+    if rid_flat.size:
+        both_valid_flat = rid_in_target & sparse_valid_flat
+        if both_valid_flat.any():
+            ids = rid_flat[both_valid_flat]
+            vals = v_flat[both_valid_flat]
+            # calculate sum grouped by ids (row no.)
             sum_x = np.bincount(ids, weights=vals, minlength=n_rows)
             sum_x2 = np.bincount(ids, weights=vals * vals, minlength=n_rows)
             sum_xt = np.bincount(
-                ids, weights=vals * weighted[i_all[both]], minlength=n_rows
+                ids, weights=vals * weighted[sid_flat[both_valid_flat]], minlength=n_rows
             )
 
-        dropped = in_target & ~listed_valid
+        # samples with valid target but not valid sparse, need to be dropped from sum_t0/sum_t20
+        dropped = rid_in_target & ~sparse_valid_flat
         if dropped.any():
-            ids = row_ids[dropped]
-            dropped_t = target[i_all[dropped]]
+            ids = rid_flat[dropped]
+            dropped_t = target[sid_flat[dropped]]
+            # calculate sum dropped from target grouped by ids (row no.)
             bad_sum = np.bincount(ids, weights=dropped_t, minlength=n_rows)
             bad_sum2 = np.bincount(
                 ids, weights=dropped_t * dropped_t, minlength=n_rows
@@ -775,7 +904,7 @@ def raw_moment_ld_sparse(
     t = np.asarray(target, dtype=np.float64)
     tv = _resolve_target_mask(target, target_valid, compute_mask)
     vv = _resolve_sparse_value_masks(values, value_valid, compute_mask)
-    n, bad = _sanity_sparse(t, sample_idxs, values, tv, vv)
+    n, bad = _check_sparse_sample_ct_block_const(t, sample_idxs, values, tv, vv)
     r, _ = _raw_sparse_sums(t, sample_idxs, values, tv, vv, n, bad)
     return np.clip(r, -1.0, 1.0), n
 
@@ -798,7 +927,7 @@ def _ld_dense(
     """
 
     n_rows = int(block.shape[0])
-    n, bad = _check_sample_ct_dense(target, block, target_valid, block_valid)
+    n, bad = _check_dense_sample_ct(target, block, target_valid, block_valid)
     if force_centered:
         r = _centered_dense(target, block, target_valid, block_valid, n, bad)
         return np.clip(r, -1.0, 1.0), n, n_rows
@@ -829,7 +958,7 @@ def _ld_sparse(
     """
 
     n_rows = len(sample_idxs)
-    n, bad = _sanity_sparse(target, sample_idxs, values, target_valid, value_valid)
+    n, bad = _check_sparse_sample_ct_block_const(target, sample_idxs, values, target_valid, value_valid)
     if force_centered:
         r = _centered_sparse(
             target, sample_idxs, values, target_valid, value_valid, n, bad
@@ -854,46 +983,6 @@ def _ld_sparse(
 # --------------------------------------------------------------------------- #
 # block dispatcher
 # --------------------------------------------------------------------------- #
-
-def _dense_complete_rows(
-    dense: npt.NDArray,
-    block_valid: npt.NDArray[np.bool_] | None,
-    target_valid: npt.NDArray[np.bool_] | None,
-) -> npt.NDArray[np.bool_]:
-    """Rows with a valid call on every sample selected by ``target_valid``."""
-
-    n_rows = int(dense.shape[0])
-    if block_valid is None:
-        return np.ones(n_rows, dtype=bool)
-    inv_rows, inv_cols = np.nonzero(~block_valid)
-    if target_valid is not None and inv_rows.size:
-        inv_rows = inv_rows[target_valid[inv_cols]]
-    if inv_rows.size == 0:
-        return np.ones(n_rows, dtype=bool)
-    return np.bincount(inv_rows, minlength=n_rows) == 0
-
-
-def _sparse_complete_rows(
-    sample_idxs: list[npt.NDArray[np.uint32]],
-    values: list[npt.NDArray],
-    value_valid: list[npt.NDArray[np.bool_]] | None,
-    target_valid: npt.NDArray[np.bool_] | None,
-) -> npt.NDArray[np.bool_]:
-    """Sparse rows with no missing call on the target's valid samples."""
-
-    n_rows = len(sample_idxs)
-    out = np.ones(n_rows, dtype=bool)
-    if value_valid is None:
-        return out
-    for row in range(n_rows):
-        mask = np.asarray(value_valid[row], dtype=bool)
-        if mask.all():
-            continue
-        idx = np.asarray(sample_idxs[row])
-        if target_valid is None or bool((target_valid[idx] & ~mask).any()):
-            out[row] = False
-    return out
-
 
 def pearson_pairwise_block(
     target: npt.NDArray,
@@ -961,13 +1050,6 @@ def pearson_pairwise_block(
         values = block.sparse_values
         rows = block.sparse_rows
         value_valid = _sparse_value_masks(values)
-        complete = _sparse_complete_rows(
-            sample_idxs, values, value_valid, target_valid
-        )
-        row_count = len(values)
-        complete_count = int(complete.sum())
-        complete_pair += complete_count
-        incomplete_pair += row_count - complete_count
         r[rows], n[rows], centered = _ld_sparse(
             target.astype(np.float64),
             sample_idxs,
@@ -976,6 +1058,14 @@ def pearson_pairwise_block(
             value_valid,
             force_centered,
         )
+        # LD pair summary
+        row_count = len(values)
+        n_miss = n_keep - n[rows]
+        assert np.all(n_miss >= 0)
+        complete = n_miss == 0
+        complete_count = int(complete.sum())
+        complete_pair += complete_count
+        incomplete_pair += row_count - complete_count
         centered_moment_pair += centered
         raw_moment_pair += row_count - centered
 
@@ -1002,4 +1092,5 @@ __all__ = [
     "pearson_pairwise_block",
     "raw_moment_ld_dense",
     "raw_moment_ld_sparse",
+    "target_qc",
 ]

@@ -535,3 +535,28 @@ def test_unmatched_target_exits_0(tiny_pair, tmp_path):
     out_path = tmp_path / "out.vcor"
     assert cli_main(_base_args(prefix_a, prefix_b, out_path, target="not-a-variant")) == 0
     assert len(_read_rows(out_path)[1]) == 0  # header + no rows
+
+
+def test_degenerate_target_writes_no_rows(tmp_path):
+    """A target with fewer than three valid samples skips every pair at once."""
+
+    variants = [("1", "1:100:A:G", 100, "A", "G"), ("1", "1:150:A:G", 150, "A", "G")]
+    prefix_a = make_bfile(
+        tmp_path,
+        "a",
+        np.array([[-9, -9, -9, -9, 1, 2]], dtype=np.int8),
+        IDS,
+        variants[:1],
+    )
+    prefix_b = make_bfile(
+        tmp_path,
+        "b",
+        np.array([[0, 0, 1, 1, 2, 2], [0, 1, 0, 2, 0, 2]], dtype=np.int8),
+        IDS,
+        variants,
+    )
+    out_path = tmp_path / "out.vcor"
+    assert cli_main(_base_args(prefix_a, prefix_b, out_path)) == 0
+    header, rows = _read_rows(out_path)
+    assert rows == []
+    assert header.endswith("UNPHASED_R2")

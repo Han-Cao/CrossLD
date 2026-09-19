@@ -178,6 +178,52 @@ def test_skipped_pairs_are_logged(captured, tmp_path):
     ]
 
 
+@pytest.mark.parametrize(
+    "genotypes_a, reason",
+    [
+        (np.array([[2, 2, 2, 2, 2, 2]], dtype=np.int8), "low_variance"),
+        (np.array([[-9, -9, -9, -9, 1, 2]], dtype=np.int8), "n<3"),
+    ],
+    ids=["constant-target", "too-few-valid-samples"],
+)
+def test_degenerate_target_skips_every_block(captured, tmp_path, genotypes_a, reason):
+    """Target-level QC runs once per target, so no block is read at all."""
+
+    variants = [("1", "1:100:A:G", 100, "A", "G"), ("1", "1:150:A:G", 150, "A", "G")]
+    prefix_a = make_bfile(tmp_path, "a", genotypes_a, _IDS, variants[:1])
+    prefix_b = make_bfile(
+        tmp_path,
+        "b",
+        np.array([[0, 0, 1, 1, 2, 2], [0, 1, 0, 2, 0, 2]], dtype=np.int8),
+        _IDS,
+        variants,
+    )
+    out_path = tmp_path / "out.vcor"
+    result = cli_main(
+        [
+            "--debug",
+            "--bfile1", prefix_a,
+            "--bfile2", prefix_b,
+            "--ld-snp", "1:100:A:G",
+            "--ld-window", "0",
+            "--ld-window-kb", "10",
+            "--ld-window-r2", "0",
+            "--out", str(out_path),
+        ]
+    )
+    assert result == 0
+    # Both candidates are skipped for the target-level reason and, because the
+    # check is hoisted before the block loop, no block is ever read.
+    assert not any(r.getMessage().startswith("block ") for r in captured.records)
+    assert any(
+        "skip reasons" in r.getMessage() and f"{reason}=2" in r.getMessage()
+        for r in captured.records
+    )
+    assert out_path.read_text(encoding="utf-8").splitlines() == [
+        "#CHROM_A\tPOS_A\tID_A\tCHROM_B\tPOS_B\tID_B\tUNPHASED_R2"
+    ]
+
+
 def test_quiet_suppresses_info(captured, sample1_prefix, sample2_prefix, tmp_path):
     result = cli_main(
         [

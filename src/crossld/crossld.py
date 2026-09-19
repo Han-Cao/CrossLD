@@ -6,6 +6,7 @@ import argparse
 import logging
 import sys
 import time
+from collections.abc import Iterable
 from dataclasses import dataclass, field
 
 import numpy as np
@@ -19,6 +20,7 @@ from crossld.ld import (
     major_allele_flipped,
     major_allele_flipped_sparse,
     pearson_pairwise_block,
+    target_qc,
 )
 from crossld.logging_setup import LOGGER_NAME, configure_logging
 from crossld.plinkio import (
@@ -271,14 +273,25 @@ def crossld(
         target_arr = target_vectors[index]
         sign_a = target_neg_signs.get(index, 1) # if not in target_neg_signs, it is 1
 
-        if len(candidates) == 0:
-            logger.debug("Variant %s has no dataset-2 variants within --ld-window-kb %s", 
-                         ds1.ids[index], args.ld_window_kb)
+        # Target-level QC depends only on the target vector, so it is checked
+        # once per target. A degenerate target skips every candidate pair, so the
+        # blocks are never read.
+        skip_reason = target_qc(target_arr)
+        if skip_reason is not None:
+            progress.skipped += len(candidates)
+            progress.skip_reasons[skip_reason] += len(candidates)
             block_total = 0
+            block_slices: Iterable[tuple[int, int]] = ()
         else:
-            block_total = max(1, -(-len(candidates) // block_size))
-            
-        for block_no, (start, end) in enumerate(_block_slices(len(candidates), block_size), start=1):
+            if len(candidates) == 0:
+                logger.debug("Variant %s has no dataset-2 variants within --ld-window-kb %s", 
+                             ds1.ids[index], args.ld_window_kb)
+                block_total = 0
+            else:
+                block_total = max(1, -(-len(candidates) // block_size))
+            block_slices = _block_slices(len(candidates), block_size)
+
+        for block_no, (start, end) in enumerate(block_slices, start=1):
             block_var_idx = candidates[start:end]
             block = reader2.read(block_var_idx)
             block_stats = block.stats
