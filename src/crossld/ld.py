@@ -24,13 +24,6 @@ observation) so missingness is inspected only once. When no mask is supplied,
 the ``compute_mask`` flag decides what ``None`` means: with ``compute_mask=False``
 a ``None`` mask means "nothing is missing", while with ``compute_mask=True`` a
 ``None`` mask is derived from the input (``value >= 0``).
-
-Before any moment math a **sanity check** runs per pair: fewer than three
-non-missing samples, or a target / block row that is constant over the
-pairwise-valid samples, yields ``NaN`` directly. Any **suspicious** raw result
-(raw variance ≤ 0, non-finite raw moment, ``|r| > 1``, or a cancellation
-heuristic) is recomputed with the centered method, and is only ``NaN`` if the
-centered result is degenerate as well.
 """
 
 from __future__ import annotations
@@ -297,6 +290,7 @@ def _check_dense_sample_ct(
     else:
         # if both have missingness, then count both valid
         n = np.count_nonzero(block_valid & target_valid[None, :], axis=1)
+    n = np.asarray(n, dtype=np.uint32)
     bad = n < _MIN_SAMPLES
 
     return n, bad
@@ -743,8 +737,9 @@ def _raw_dense_sums(
         incomplete = ~complete
         if incomplete.any():
             subset = block[incomplete]
+            subset_valid = block_valid[incomplete]
             # sum invalid values as 0, not affecting the result
-            zeroed = np.where(subset >= 0, subset, 0.0)
+            zeroed = np.where(subset_valid, subset, 0.0)
             sum_b[incomplete], sum_b2[incomplete], sum_tb[incomplete] = _raw_dense_block_sums(zeroed, weight, t_values)
             dropped_t = target[inv_cols]
             bad_sum = np.bincount(inv_rows, weights=dropped_t, minlength=n_rows)
