@@ -7,6 +7,12 @@ Cross-dataset Linkage Disequilibrium analysis.
 
 - [Overview](#overview)
 - [Installation](#installation)
+- [Quick start](#quick-start)
+- [Options](#options)
+- [Multithreading](#multithreading)
+- [Memory usage](#memory-usage)
+- [Important notes](#important-notes)
+- [LICENSE](#license)
 
 ## Overview
 `CrossLD` calculates linkage disequilibrium (LD) between variants from different [PLINK1/2 binary](https://www.cog-genomics.org/plink/2.0/input) datasets. It selects target variant(s) from one dataset and calculates unphased LD with their nearby variants from another dataset. This is useful to analyze LD between different variant callsets (e.g., SNV vs CNV) of the same (or overlapping) samples without merging datasets, particularly for large biobank-scale datasets.
@@ -86,11 +92,23 @@ Others:
   -h, --help            show this help message and exit
 ```
 
+## Multithreading
+The main loop is single-threaded, but the core LD calculation algorithm is largely based on [NumPy](https://numpy.org/), which may use all available cores by default. To control the number of threads, set the following environment variables before running `crossld`:
+
+```bash
+threads=16
+export MKL_NUM_THREADS=$threads
+export NUMEXPR_NUM_THREADS=$threads
+export OMP_NUM_THREADS=$threads
+export OPENBLAS_NUM_THREADS=$threads
+export VECLIB_MAXIMUM_THREADS=$threads
+```
+
 ## Memory usage
 
-For biobank-scale datasets, memory usage can be a concern when a large LD window is used. By default, `crossld` reads variants within each LD window by blocks. So reducing `--block-size` can significantly reduce memory usage. However, a very small block size (e.g., < 100) will also slow down the analysis. Using PLINK2's binary format can also reduce memory usage because it supports sparse representation of rare variants.
+For biobank-scale datasets, memory usage can be a critical concern when a large LD window is used. By default, `crossld` reads variants within each LD window by blocks. So reducing `--block-size` can significantly reduce memory usage. However, a small block size (e.g., < 100) will also slow down the analysis.
 
-If there are multiple consecutive target variants, `crossld` can cache the dataset-2 blocks to be reused for the next target. The cache size is controlled by `--cache-limit` and `--cache-min-overlap`. A larger cache limit will reduce I/O and speed up the analysis, but it will also increase memory usage.
+If there are multiple consecutive target variants (e.g., multiple independent SNPs in the same locus), `crossld` can cache the dataset-2 blocks to be reused for the next target variant. The maximum number of cached blocks is controlled by `--cache-limit`. A larger cache limit will reduce I/O and speed up the analysis, but it will also increase memory usage.
 
 The default `--block-size 200 --cache-limit 5` is optimized for balanced memory usage and runtime on the 500k UK Biobank dataset with multiple consecutive target variants. For smaller datasets or less consecutive targets, increasing `--block-size` should speed up the analysis.
 
@@ -102,6 +120,8 @@ The default `--block-size 200 --cache-limit 5` is optimized for balanced memory 
 - **Position sorting**: both sorted and unsorted datasets are supported. Because `crossld` will sort dataset-2 to index variants if it is unsorted, using a sorted dataset 2 will save time. However, since [pgenlib](https://github.com/chrchang/plink-ng/blob/master/2.0/Python/python_api.txt) may not always support unsorted multi-variant query, sorted dataset 2 may be required in the future.
 
 - **Liftover**: it is possible that different variant callset were generated based on different genome builds. Since `crossld` does not require dataset 1 to be position sorted, it would be easier to only liftover dataset 1 by directly replacing the `.pvar` or `.bim` file with the lifted-over version rather than liftover the whole dataset.
+
+- **Variant ID**: variant IDs are used to index variants in both datasets. If multiple variants have the same ID, all of them will be included in the LD analysis.
 
 ## LICENSE
 [MIT License](LICENSE)
