@@ -1,174 +1,107 @@
-# crossLD
+# CrossLD
 
-Cross-dataset linkage disequilibrium between PLINK 1 (`--bfile`) and PLINK 2
-(`--pgen/--pvar/--psam`) datasets.
+[![pytest](https://github.com/Han-Cao/crossLD/actions/workflows/pytest.yml/badge.svg)](https://github.com/Han-Cao/crossLD/actions)
+[![Coverage](https://img.shields.io/endpoint?url=https://gist.githubusercontent.com/han-cao/5baaf521e0e161712d3493546f6a8876/raw/CrossLD-cobertura-coverage.json)](https://github.com/Han-Cao/crossLD)
 
-`crossLD` picks target variants from **dataset 1** and correlates them (pairwise
-unphased Pearson r / r²) against every nearby variant in **dataset 2**, reading
-both files block-wise through [`pgenlib`](https://pypi.org/project/Pgenlib/).
-Because the two datasets are read with the same per-sample index arrays, LD is
-always computed on the samples the two datasets share.
+Cross-dataset Linkage Disequilibrium analysis.
 
-## Install
+- [Overview](#overview)
+- [Installation](#installation)
 
+## Overview
+`CrossLD` calculates linkage disequilibrium (LD) between variants from different [PLINK1/2 binary](https://www.cog-genomics.org/plink/2.0/input) datasets. It selects target variant(s) from one dataset and calculates unphased LD with their nearby variants from another dataset. This is useful to analyze LD between different variant callsets (e.g., SNV vs CNV) of the same (or overlapping) samples without merging datasets, particularly for large biobank-scale datasets.
+
+Key features:
+- Fast PLINK1/2 binary reading with [pgenlib](https://pypi.org/project/pgenlib/), supporting hardcall and dosage genotypes.
+- Optimized data structure and algorithm for sparse genotype matrices to speed up analysis for biobank-scale datasets with low memory usage.
+- Identical LD results to PLINK2's `--r[2]-unphased` function.
+
+
+## Installation
+
+With Python 3.10+, clone this repo and install by pip:
 ```bash
-pip install -e .            # provides the `crossLD` console script
+pip install -e .
 ```
 
-`pip install -e .` needs `setuptools` available in the environment. Tests can
-also be run straight from a checkout without installing: the repository
-`conftest.py` puts `src/` on `sys.path`.
+For development and testing, install the dev dependencies:
+```bash
+pip install -e .[dev]
+```
+
 
 ## Quick start
 
 ```bash
-crossLD \
+crossld \
   --pfile1 tests/data/1kg.sample1 \
   --pfile2 tests/data/1kg.sample2 \
   --ld-snp-list tests/data/ld_snp_list.txt \
   --extract tests/data/ld_extract_snp_list.txt \
   --ld-window-r2 0.05 \
+  --ld-window-kb 500 \
   --out out.vcor
 ```
 
-`tests/data/` carries three curated reference files for that command over four
-dataset-1 targets: `ld_results_r2.vcor` (`UNPHASED_R2`),
-`ld_results_r_major.vcor` (signed `UNPHASED_R` toward each variant's major
-allele, with `MAJ_A`/`MAJ_B` columns) and `ld_results_r_ref.vcor` (signed
-`UNPHASED_R` toward REF, with `REF_A`/`REF_B`). All three are reproduced by
-`tests/test_reference.py`.
-
-PLINK 1 inputs work the same way:
-
-```bash
-crossLD --bfile1 cohort --bfile2 reference --ld-snp 20:114311:G:T --ld-window-r2 0.2
-```
+This will calculate LD between two example datasets from the 1000 Genomes Project. Each dataset contains 200 samples with 100 samples overlapping. For each target variant in `ld_snp_list.txt`, the program will calculate LD with nearby variants in `ld_extract_snp_list.txt` within 500kb and output results with r2 >= 0.05 to `out.vcor`. The output format is the same as PLINK2's [.vcor](https://www.cog-genomics.org/plink/2.0/formats#vcor) format.
 
 ## Options
 
-| Option | Description |
-| --- | --- |
-| `--bfile1 P` / `--pfile1 P` | dataset-1 prefix (PLINK 1 `.bed/.bim/.fam` or PLINK 2 `.pgen/.pvar/.psam`) |
-| `--bfile2 P` / `--pfile2 P` | dataset-2 prefix |
-| `--ld-snp ID` | single dataset-1 target variant |
-| `--ld-snps LIST` | comma-separated dataset-1 target variant IDs |
-| `--ld-snp-list FILE` | file of target IDs, one per line (`#` comments ignored) |
-| `--keep FILE` | restrict samples to those listed (single-column IID file; a leading `#` header line is ignored) |
-| `--extract FILE` / `--exclude FILE` | keep/drop dataset-2 variants by ID (one ID per line) |
-| `--extract-bed FILE` / `--exclude-bed FILE` | keep/drop dataset-2 variants in 0-based, half-open interval BED regions (`CHROM START END`) |
-| `--ld-window N` | max number of dataset-2 variants nearest to the target (by absolute position distance); `0` disables the count limit (default `1000`) |
-| `--ld-window-kb KB` | max distance in kb from the target (default `1000`) |
-| `--ld-window-r2 R2` | only report pairs with `r²` at least this large; `0` disables the filter (default `0.2`) |
-| `--dosage` / `--dosage1` / `--dosage2` | use dosages instead of hardcalls for both / one dataset |
-| `--ref-based` | orient r to REF alleles instead of each variant's major allele |
-| `--r` | report signed `UNPHASED_R` plus the coding allele per side (`MAJ_A`/`MAJ_B`, or `REF_A`/`REF_B` with `--ref-based`) instead of `UNPHASED_R2` |
-| `--block-size N` | variants read per block (default `200`) |
-| `--cache-limit N` | max number of dataset-2 **blocks** cached across overlapping target windows, keeping the rightmost (default `5`; `0` disables) |
-| `--cache-min-overlap F` | cache a block only when its overlap with the next target's candidates exceeds this fraction of the block (default `0.5`) |
-| `--out FILE` | output file (default: stdout) |
-| `--debug` / `--quiet` | DEBUG / WARNING logging (default INFO) |
+```text
+Required:
+  --bfile1 PREFIX       PLINK 1 .bed/.bim/.fam prefix (dataset 1)
+  --pfile1 PREFIX       PLINK 2 .pgen/.pvar/.psam prefix (dataset 1)
+  --bfile2 PREFIX       PLINK 1 .bed/.bim/.fam prefix (dataset 2)
+  --pfile2 PREFIX       PLINK 2 .pgen/.pvar/.psam prefix (dataset 2)
+  -o, --out FILE        output file (default: stdout)
+  --ld-snp ID           single target variant ID in dataset 1
+  --ld-snps LIST        comma-separated target variant IDs in dataset 1
+  --ld-snp-list FILE    file of dataset-1 target variant IDs (one per line)
 
-## Output
+Variant filtering:
+  --keep FILE           single-column list of sample IID to keep for LD analysis (default: all overlap samples)
+  --extract FILE        single-column list of variant IDs to keep in dataset 2
+  --extract-bed BED     BED file of genomic regions to keep in dataset 2 (0-based half-open)
+  --exclude FILE        single-column list of variant IDs to drop in dataset 2
+  --exclude-bed BED     BED file of genomic regions to drop in dataset 2 (0-based half-open)
 
-The default output is `r²` only, tab-separated with six significant digits:
+LD analysis:
+  --r                   report unphased r instead of r2 (default: r2)
+  --ref-based           report r to REF alleles instead of each variant's major allele
+  --ld-window N         max number of variants in dataset 2 to include for LD analysis (default: 0 for no limit)
+  --ld-window-kb KB     max distance in kb to include variants for LD analysis (default: 1000.0)
+  --ld-window-r2 R2     min r2 to report LD pairs (default: 0.2)
+  --dosage              use genotype dosages for both datasets
+  --dosage1             use genotype dosages for dataset 1
+  --dosage2             use genotype dosages for dataset 2
+  --block-size N        number of variants read per block (default: 200)
+  --cache-limit N       max number of dataset-2 blocks cached across overlapping target windows, keeping the rightmost (default: 5; 0 disables)
+  --cache-min-overlap F
+                        cache a block only when its overlap with the next target's candidates exceeds this fraction of the block (default: 0.5)
 
-```
-#CHROM_A	POS_A	ID_A	CHROM_B	POS_B	ID_B	UNPHASED_R2
-20	114311	20:114311:G:T	20	101498	20:101498:A:G	0.0910081
-```
-
-With `--r` the signed correlation is reported instead, together with the allele
-each side is coded by, so the sign is interpretable:
-
-```
-#CHROM_A	POS_A	ID_A	MAJ_A	CHROM_B	POS_B	ID_B	MAJ_B	UNPHASED_R
-20	114311	20:114311:G:T	G	20	101498	20:101498:A:G	A	-0.301675
-```
-
-The allele columns are named `MAJ_A`/`MAJ_B` for the default major-allele
-orientation and `REF_A`/`REF_B` with `--ref-based`. `--ld-window-r2` still
-filters on `r²` in either shape.
-
-Rows are emitted in dataset-1 variant order and then by ascending dataset-2
-position. A dataset-1 target that is also present in dataset 2 is correlated
-against itself and reported with `r`/`r²` of `1`.
-
-## Conventions
-
-* **Samples**: the IID intersection of the two datasets is used by default;
-  `--keep` narrows it further and warns about requested samples that are absent
-  from either dataset. Each dataset keeps its own file order (pgenlib requires
-  increasing sample indexes); `idx_bridge` permutes the dataset-1 vectors into
-  dataset-2 order before correlation, so the two files may list their samples in
-  any order.
-* **Sign**: `r` is the Pearson correlation of unphased ALT-coded dosages. No
-  vector is recoded: `r^2` is orientation independent, `--ref-based` reports the
-  ALT-coded correlation (identical to the REF-coded one, since both sides flip),
-  and the default major-allele `r` is the ALT-coded `r` negated for each side
-  whose ALT allele is the minor allele. A positive sign then means the major
-  alleles are positively correlated. The `MAJ_A`/`MAJ_B` (or `REF_A`/`REF_B`)
-  columns record the allele each side is oriented to.
-* **Orientation**: variants whose REF/ALT are swapped between datasets are
-  handled automatically, because each side is oriented within its own dataset.
-* **Allele metadata**: REF/ALT strings are never cached; they are decoded on
-  demand from the `.pvar`/`.bim` reader only for the rows that are actually
-  written. An `r²`-only run reports `r²` without reading any allele strings, and
-  a `--r` run only pays for its output rows.
-* **Read cache**: whole dataset-2 blocks decoded for a target are kept for the
-  next target when their overlap with the next window exceeds
-  `--cache-min-overlap`, so shared variants are not read from the
-  `.pgen`/`.bed` twice. A reused block is served as a view (no row copy):
-  partially overlapping blocks are sliced to the shared rows. `--cache-limit`
-  bounds the number of cached blocks, keeping the rightmost (nearest the forward
-  target); approximate memory is `--cache-limit * --block-size * samples *
-  itemsize` (8 bytes per dosage, 1 byte per hardcall), plus one block of slack.
-  `0` disables the cache. The cache changes only I/O — every `--cache-limit`
-  and `--cache-min-overlap` produces identical output.
-* **Filters**: `--extract*`/`--exclude*` apply to dataset 2 only, and the variant
-  count used by `--ld-window` is measured over the surviving variants.
-* **Windows**: `--ld-window N` keeps the `N` dataset-2 variants nearest to the
-  target by absolute position distance, and `--ld-window-kb` bounds the physical
-  distance. `--ld-window 0` disables the count limit. Because dataset 1 and
-  dataset 2 are separate files, this is deliberately not PLINK 2's
-  "variant-column distance + 1" interpretation.
-* **r² threshold**: `--ld-window-r2` keeps pairs with `r²` greater than **or
-  equal to** the value (so `--ld-window-r2 1` keeps the perfectly correlated
-  pairs); `--ld-window-r2 0` disables the filter entirely.
-* **Sparse reads**: each block is split per variant. Variants whose `.pgen`
-  representation is sparse are read with `pgenlib`'s sparse readers and their
-  correlations are computed directly from the sparse rows (samples absent from a
-  sparse row are homozygous REF), while the remaining variants are read densely.
-  Target vectors are always read densely. Sparse reads are used automatically
-  whenever the data supports them; there is no CLI switch.
-* Only biallelic variants are supported; multiallelic input is rejected.
-
-## Logging
-
-Diagnostics go to **stderr**, so stdout stays a clean result stream.
-
-* Default (`INFO`): per-dataset summary, sample/filter summaries, one line per
-  resolved target with its candidate/pair counts and elapsed time, and a final
-  run summary.
-* `--debug` (`DEBUG`): adds detailed per-block statistics (variant counts, index
-  range, read mode, dense/sparse row counts, pairs evaluated/kept/skipped,
-  elapsed time), per-target plan details, skip reasons, and the per-target read
-  cache line (`reused_variants`, `cached_blocks`).
-* `--quiet` (`WARNING`): suppresses the INFO lines.
-
-```
-[2026-09-14 12:00:00] - [INFO]: target 1/4 20:114311:G:T 20:114311 candidates=537 pairs_kept=231 pairs_below_r2=306 pairs_skipped=0 elapsed=0.006s
-[2026-09-14 12:00:00] - [DEBUG]: block 1/3 variants=200 rows=0-205 mode=hardcall dense_variants=114 sparse_variants=86 pairs_evaluated=200 pairs_kept=58 pairs_below_r2=142 pairs_skipped=0 elapsed=0.002s
-[2026-09-14 12:00:00] - [INFO]: done: 4 target(s), 788 pair(s) written
+Others:
+  --debug               DEBUG logging
+  --quiet               WARNING logging only
+  -v, --version         show program's version number and exit
+  -h, --help            show this help message and exit
 ```
 
-## Development
+## Memory usage
 
-```bash
-pytest                       # runs the whole test suite
-pytest --cov=crossld --cov-report=term-missing   # optional coverage report
-```
+For biobank-scale datasets, memory usage can be a concern when a large LD window is used. By default, `crossld` reads variants within each LD window by blocks. So reducing `--block-size` can significantly reduce memory usage. However, a very small block size (e.g., < 100) will also slow down the analysis. Using PLINK2's binary format can also reduce memory usage because it supports sparse representation of rare variants.
 
-The layout is `src/crossld/`: `plinkio` (dataset/sample/variant resolution),
-`varfilter` (dataset-2 extraction), `blocks` (sparse-aware block reads), `ld`
-(correlation math), `results` (output formatting), `logging_setup`, and
-`crossld` (the CLI / orchestration module).
+If there are multiple consecutive target variants, `crossld` can cache the dataset-2 blocks to be reused for the next target. The cache size is controlled by `--cache-limit` and `--cache-min-overlap`. A larger cache limit will reduce I/O and speed up the analysis, but it will also increase memory usage.
+
+The default `--block-size 200 --cache-limit 5` is optimized for balanced memory usage and runtime on the 500k UK Biobank dataset with multiple consecutive target variants. For smaller datasets or less consecutive targets, increasing `--block-size` should speed up the analysis.
+
+
+## Important notes
+
+- **PLINK1 binary vs PLINK2 binary**: `crossld` supports both PLINK1 and PLINK2 binary formats. The two input datasets can be in different formats, but PLINK2 is always recommended for better performance. Genotype dosage is only supported in PLINK2 binary format.
+
+- **Position sorting**: both sorted and unsorted datasets are supported. Because `crossld` will sort dataset-2 to index variants if it is unsorted, using a sorted dataset 2 will save time. However, since [pgenlib](https://github.com/chrchang/plink-ng/blob/master/2.0/Python/python_api.txt) may not always support unsorted multi-variant query, sorted dataset 2 may be required in the future.
+
+- **Liftover**: it is possible that different variant callset were generated based on different genome builds. Since `crossld` does not require dataset 1 to be position sorted, it would be easier to only liftover dataset 1 by directly replacing the `.pvar` or `.bim` file with the lifted-over version rather than liftover the whole dataset.
+
+## LICENSE
+[MIT License](LICENSE)
