@@ -126,7 +126,7 @@ def test_major_allele_flipped_sparse_matches_dense():
         np.array([0.0, 0.0, 0.0, 0.0, 2.0]),
         np.array([1.0, -9.0, 0.0]),
     ):
-        idx, values = _sparsify(dense)
+        _idx, values = _sparsify(dense)
         assert major_allele_flipped_sparse(values, sample_ct=dense.size) is (
             major_allele_flipped(dense)
         )
@@ -510,12 +510,12 @@ def test_block_empty_read():
 
 def test_block_routing_splits_clean_and_missing_rows():
     block = _mixed_block()
-    r, n = pearson_pairwise_block(TARGET, block)
+    _r, n = pearson_pairwise_block(TARGET, block)
     assert block.stats.complete_pair == 3
     assert block.stats.incomplete_pair == 2
     assert block.stats.raw_moment_pair == 5
     assert block.stats.centered_moment_pair == 0
-    assert list(int(x) for x in n) == [6, 6, 6, 5, 5]
+    assert [int(x) for x in n] == [6, 6, 6, 5, 5]
 
 
 def test_block_force_centered_matches_default_and_skips_raw_method():
@@ -562,7 +562,7 @@ def test_block_incomplete_target_routing():
     assert block.stats.complete_pair == 2
     assert block.stats.incomplete_pair == 2
     assert block.stats.raw_moment_pair + block.stats.centered_moment_pair == 4
-    assert list(int(x) for x in n) == [5, 4, 5, 4]
+    assert [int(x) for x in n] == [5, 4, 5, 4]
     assert np.array_equal(n, n_forced)
     assert np.allclose(r, r_forced, atol=1e-12, equal_nan=True)
 
@@ -696,7 +696,7 @@ def test_check_sample_ct_sparse_counts_pairwise_valid_and_block_constancy():
     n, bad = _check_sparse_sample_ct_block_const(
         target, [idx, idx], values, None, [v >= 0 for v in values]
     )
-    assert list(int(x) for x in n) == [6, 2]  # constant row, then n < 3
+    assert [int(x) for x in n] == [6, 2]  # constant row, then n < 3
     assert list(bad) == [True, True]
 
 

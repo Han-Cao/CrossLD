@@ -18,7 +18,7 @@ from crossld.plinkio import (
     resolve_targets,
     select_samples,
 )
-from tests.conftest import make_bfile, make_pfile, write_psam, write_pvar
+from tests.conftest import make_bfile, make_pfile, write_psam
 
 SAMPLES = [f"S{i}" for i in range(6)]
 DS1_VARIANTS = [
@@ -253,7 +253,7 @@ def test_resolve_targets_merges_all_sources(synthetic_pair, tmp_path):
 # --------------------------------------------------------------------------- #
 
 def test_apply_variant_filter_restricts_sorted_index(synthetic_pair):
-    ds1, ds2 = synthetic_pair
+    _ds1, ds2 = synthetic_pair
     mask = np.zeros(ds2.variant_ct, dtype=bool)
     mask[[1, 3]] = True  # positions 900 and 1100
     ds2.apply_variant_filter(mask)

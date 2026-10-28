@@ -309,7 +309,7 @@ def crossld(
             block_stats.block_index = block_no
             block_stats.block_total = block_total
 
-            r_values, n_values = pearson_pairwise_block(target_arr, block)
+            r_values, _n_values = pearson_pairwise_block(target_arr, block)
             r2_values = r_values * r_values # r2 is always required for thresholding
             if args.with_r:
                 signs_b, alleles_b = _block_allele_info(ds2, block_var_idx, block, allele_label)
