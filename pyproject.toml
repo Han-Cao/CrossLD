@@ -7,7 +7,7 @@ name = "crossLD"
 version = "0.1.0"
 description = "Cross-dataset linkage disequilibrium between PLINK 1 (bfile) and PLINK 2 (pgen) datasets"
 readme = "README.md"
-requires-python = ">=3.9"
+requires-python = ">=3.10"
 license = { text = "MIT" }
 dependencies = [
     "numpy>=1.20",
@@ -18,7 +18,7 @@ dependencies = [
 crossld = "crossld.crossld:main"
 
 [project.optional-dependencies]
-test = ["pytest", "pytest-cov"]
+dev = ["pytest", "pytest-cov", "ruff"]
 
 [tool.setuptools.packages.find]
 where = ["src"]
